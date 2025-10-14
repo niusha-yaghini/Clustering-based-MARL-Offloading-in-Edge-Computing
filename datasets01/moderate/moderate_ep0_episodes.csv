@@ -1,0 +1,2 @@
+scenario,episode_id,Delta,T_slots,hours,N_agents,seed
+moderate,0,1.0,3600,1.0,18,244

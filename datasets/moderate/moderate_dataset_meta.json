@@ -17,8 +17,6 @@
     "b_sigma_g": 0.6,
     "rho_median": 1200000000.0,
     "rho_sigma_g": 0.5,
-    "L_req_min": 1.0,
-    "L_req_max": 8.0,
     "mem_median": 64.0,
     "mem_sigma_g": 0.5,
     "p_deadline": 0.25,
