@@ -6,7 +6,7 @@ lognormal task features (parameterized by median & sigma_g), and policy-agnostic
 Now supports THREE SCENARIOS (light / moderate / heavy) similar in spirit to HOODIE experiments.
 For each scenario we:
   - synthesize time-stamped arrivals and task features for one or more episodes
-  - save CSV + (optionally) Parquet + a dataset_meta.json
+  - save CSV + a dataset_meta.json
   - plot distribution figures (PNG) for key variables
   - export a summary_stats.csv with quantiles/means
 
@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 import random, math, os, json
 import matplotlib.pyplot as plt
+import hashlib, time, platform, getpass
+import math
 
 # -------------------------
 # reproducibility
@@ -57,9 +59,6 @@ class TaskFeatureDist:
     rho_median: float = 1.2e9      # cycles / MB
     rho_sigma_g: float = 0.5
 
-    L_req_min: float = 1.0
-    L_req_max: float = 8.0
-
     mem_median: float = 64.0       # MB
     mem_sigma_g: float = 0.5
 
@@ -82,7 +81,14 @@ class GlobalConfig:
 # -------------------------
 # helpers
 # -------------------------
-def lognormal_from_median_sigma_g(rng: np.random.Generator, median: float, sigma_g: float) -> float:
+def lognormal_quantile(median: float, sigma_g: float, p: float) -> float:
+    # X ~ LogNormal(mu, sigma) with median=exp(mu), sigma_g=exp(sigma)
+    # quantile(p) = median * exp( z_p * ln(sigma_g) )
+    z = {0.99: 2.3263478740408408, 0.999: 3.090232306167813}[p]
+    return median * math.exp(z * math.log(max(sigma_g, 1.0 + 1e-6)))
+  
+
+def lognormal_from_median_sigma_g(rng, median: float, sigma_g: float, qcap: float | None = 0.99) -> float:
     """
     Draw from LogNormal with given median and geometric std:
       X ~ LogNormal(mu, sigma) where median = exp(mu), sigma_g = exp(sigma).
@@ -90,7 +96,14 @@ def lognormal_from_median_sigma_g(rng: np.random.Generator, median: float, sigma
     """
     mu = math.log(max(median, 1e-12))
     sigma = math.log(max(sigma_g, 1.0 + 1e-6))
-    return float(rng.lognormal(mean=mu, sigma=sigma))
+    x = float(rng.lognormal(mean=mu, sigma=sigma))
+    if qcap is not None:
+        cap = lognormal_quantile(median, sigma_g, qcap if qcap in (0.99, 0.999) else 0.99)
+        x = min(x, cap)
+    return x
+  
+  
+  
 
 # -------------------------
 # entities
@@ -116,27 +129,23 @@ def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
 # -------------------------
 def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator) -> Dict[str, float]:
     d = cfg.TaskDist
-    # Size (MB) and compute density (cycles/MB)
-    b_mb   = lognormal_from_median_sigma_g(rng, d.b_median,   d.b_sigma_g)
-    rho    = lognormal_from_median_sigma_g(rng, d.rho_median, d.rho_sigma_g)
-    c_cyc  = b_mb * rho                              # total cycles
-    L_req  = float(rng.uniform(d.L_req_min, d.L_req_max))
-    mem_mb = lognormal_from_median_sigma_g(rng, d.mem_median, d.mem_sigma_g)
-
+    b_mb   = lognormal_from_median_sigma_g(rng, d.b_median,   d.b_sigma_g,   qcap=0.99)
+    rho    = lognormal_from_median_sigma_g(rng, d.rho_median, d.rho_sigma_g, qcap=0.99)
+    c      = b_mb * rho                              # total cycles
+    mem_mb = lognormal_from_median_sigma_g(rng, d.mem_median, d.mem_sigma_g, qcap=0.99) # qcap=None for disabling
     modality = rng.choice(["image","video","text","sensor"], p=[0.3,0.2,0.3,0.2])
-
     has_deadline = int(rng.random() < d.p_deadline)
     deadline_s   = np.nan
     if has_deadline:
         deadline_s = float(rng.uniform(d.deadline_min, d.deadline_max))
-
     non_atomic = int(rng.random() < d.p_non_atomic)
     split_ratio = float(rng.uniform(d.split_ratio_min, d.split_ratio_max)) if non_atomic else 0.0
-
+    
     return dict(
-        b_mb=b_mb, rho=rho, c_cycles=c_cyc, L_req=L_req, mem_mb=mem_mb, modality=modality,
+        b_mb=b_mb, rho=rho, c_cycles=c, mem_mb=mem_mb, modality=modality,
         has_deadline=has_deadline, deadline_s=deadline_s, non_atomic=non_atomic, split_ratio=split_ratio
     )
+
 
 # -------------------------
 # episode generator (arrivals only)
@@ -195,7 +204,6 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0) -> 
                     "b_mb": feat["b_mb"],
                     "rho_cyc_per_mb": feat["rho"],
                     "c_cycles": feat["c_cycles"],
-                    "L_req": feat["L_req"],
                     "mem_mb": feat["mem_mb"],
                     "modality": feat["modality"],
                     "has_deadline": feat["has_deadline"],
@@ -223,9 +231,6 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0) -> 
     arrivals_df = pd.DataFrame(rows_arrivals)
     tasks_df    = pd.DataFrame(rows_tasks)
 
-    # Post-process: assign task classes using quantiles computed on this batch
-    tasks_df = assign_task_classes(tasks_df)
-
     # Optimize dtypes (optional but useful)
     if len(tasks_df):
         tasks_df["modality"] = tasks_df["modality"].astype("category")
@@ -238,49 +243,6 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0) -> 
         "tasks":    tasks_df
     }
 
-
-def assign_task_classes(tasks_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assign class_label based on quantiles in the generated batch:
-      - time_sensitive   : has_deadline == 1 and deadline_s <= q30(deadline_s of non-NaN)
-      - data_heavy       : b_mb >= q70(b_mb)
-      - compute_heavy    : c_cycles >= q70(c_cycles)
-      - normal           : otherwise
-    Priority: time_sensitive > data_heavy > compute_heavy > normal
-    """
-    if tasks_df.empty:
-        tasks_df["class_label"] = pd.Categorical([], categories=[
-            "time_sensitive", "data_heavy", "compute_heavy", "normal"
-        ])
-        return tasks_df
-
-    df = tasks_df.copy()
-
-    def safe_quantile(series: pd.Series, q: float, default: float) -> float:
-        series = series.dropna()
-        if len(series) == 0:
-            return default
-        return float(series.quantile(q))
-
-    q_deadline_30 = safe_quantile(df.loc[df["has_deadline"] == 1, "deadline_s"], 0.30, default=0.5)
-    q_b_70        = safe_quantile(df["b_mb"], 0.70, default=float(df["b_mb"].median() if len(df) else 3.0))
-    q_c_70        = safe_quantile(df["c_cycles"], 0.70, default=float(df["c_cycles"].median() if len(df) else 1.0))
-
-    is_time_sens  = (df["has_deadline"] == 1) & (df["deadline_s"] <= q_deadline_30)
-    is_data_heavy = (df["b_mb"] >= q_b_70)
-    is_comp_heavy = (df["c_cycles"] >= q_c_70)
-
-    class_label = np.full(len(df), "normal", dtype=object)
-    class_label[is_comp_heavy] = "compute_heavy"
-    class_label[is_data_heavy] = "data_heavy"
-    class_label[is_time_sens]  = "time_sensitive"
-
-    df["class_label"] = pd.Categorical(class_label, categories=[
-        "time_sensitive", "data_heavy", "compute_heavy", "normal"
-    ], ordered=False)
-
-    return df
-
 # -------------------------
 # save & plotting utilities
 # -------------------------
@@ -289,34 +251,51 @@ def save_dataset(dfs: Dict[str, pd.DataFrame], prefix: str = "", out_dir: str = 
     paths: Dict[str, str] = {}
     for name, df in dfs.items():
         csv_path = os.path.join(out_dir, f"{prefix}{name}.csv")
-        pq_path  = os.path.join(out_dir, f"{prefix}{name}.parquet")
         df.to_csv(csv_path, index=False)
-        try:
-            df.to_parquet(pq_path, index=False)
-        except Exception:
-            pq_path = ""
         paths[name + "_csv"] = csv_path
-        if pq_path:
-            paths[name + "_parquet"] = pq_path
     return paths
 
+def _config_fingerprint(cfg: GlobalConfig) -> str:
+    s = json.dumps({
+        "scenario": cfg.name,
+        "Episode": asdict(cfg.Episode),
+        "AgentRanges": asdict(cfg.AgentRanges),
+        "TaskDist": asdict(cfg.TaskDist)
+    }, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(s).hexdigest()[:16]
 
 def save_meta(cfg: GlobalConfig, prefix: str = "", out_dir: str = ".") -> str:
     meta = {
+        "schema_version": "1.0.0",
         "scenario": cfg.name,
         "seed": cfg.Episode.seed,
-        "Delta": cfg.Episode.Delta,
-        "T_slots": cfg.Episode.T_slots,
+        "fingerprint": _config_fingerprint(cfg),
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "env": {"python": platform.python_version(), "user": getpass.getuser()},
+        "Episode": asdict(cfg.Episode),
         "N_agents": cfg.N_agents,
         "AgentRanges": asdict(cfg.AgentRanges),
         "TaskDist": asdict(cfg.TaskDist),
+        "units": {
+            "Delta": "seconds",
+            "lam_sec": "tasks per second (per agent)",
+            "per_slot_rate": "lam_sec * Delta",
+            "b_mb": "MB",
+            "rho_cyc_per_mb": "CPU cycles per MB",
+            "c_cycles": "CPU cycles",
+            "mem_mb": "MB",
+            "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
+            "f_local": "Hz",
+            "m_local": "MB"  # اگر در کدت بایت است، اینجا صادقانه 'bytes' بنویس و یکسان‌سازی را بعداً انجام بده
+        },
         "notes": {
-            "rates_unit": "lam_sec is per-second; per-slot rate = lam_sec * Delta",
-            "b_unit": "MB",
-            "rho_unit": "cycles per MB",
-            "c_unit": "cycles",
-            "deadline_s": "relative seconds; deadline_time = t_arrival_time + deadline_s",
-            "non_atomic": "1 means task can be split; split_ratio = fraction of size that can be split"
+            "policy_agnostic": True,
+            "queueing": "not simulated here",
+            "clipping": {
+                "enabled": True,
+                "method": "lognormal analytic quantile cap",
+                "qcap": 0.99
+            }
         }
     }
     path = os.path.join(out_dir, f"{prefix}dataset_meta.json")
@@ -393,7 +372,7 @@ BASE_EPISODE = EpisodeConf(Delta=DEFAULT_DELTA, T_slots=DEFAULT_T_SLOTS, seed=GL
 BASE_AGENT_RANGES = AgentRanges(
     lam_sec_min=0.02, lam_sec_max=0.80,
     f_local_min=0.8e9, f_local_max=2.4e9,
-    m_local_min=3e9,  m_local_max=8e9
+    m_local_min=3e3,  m_local_max=8e3 #MB
 )
 BASE_TASK_DIST = TaskFeatureDist()
 
