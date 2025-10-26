@@ -1,364 +1,407 @@
 # -*- coding: utf-8 -*-
 """
-Topology generator for Edge–MEC–Cloud, aligned with HOODIE's topology generators.
-Outputs: nodes.csv, links.csv, routing.csv, topology_meta.json
+HOODIE–style Topology Builder (enhanced)
+- Separate private/public capacities (not merged)
+- Connection matrix shape: (K, K+1), last column = MEC→Cloud
+- Styles: 'fully_connected' | 'skip_connections'
+- Inputs per-second -> scaled by Delta to per-slot (HOODIE-compatible)
 
-- Layering: Edge (agents) — MEC (K_MEC) — Cloud (1)
-- MEC↔MEC + MEC→Cloud capacities are generated like HOODIE's FullyConnected or SkipConnections.
-- Edge→MEC links (bandwidth/latency) and queue policies are added per assumptions in Chapter 4.
-- Reads agents from your dataset (agents.csv) to import f_local per agent.
+Extras (without changing the core structure):
+  * Save connection_matrix.csv
+  * Draw network graph as PNG (NetworkX + Matplotlib)
+  * Write a lightweight Markdown report
 
-This is a policy-agnostic, static topology description for section 5.2.2.
+Outputs (core): topology.json, topology_meta.json
+Extras: connection_matrix.csv, topology_graph.png, topology_report.md
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict, replace
-from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional
 import numpy as np
-import pandas as pd
-import os, json, time, platform, hashlib, getpass
+import json, os, time, hashlib, platform, getpass
 
-# -------------------------
-# reproducibility
-# -------------------------
-GLOBAL_SEED = 12345
-rng_global = np.random.default_rng(GLOBAL_SEED)
+# Optional deps for graph/report
+try:
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    _GRAPH_OK = True
+except Exception:
+    _GRAPH_OK = False
 
-# -------------------------
-# units helpers
-# -------------------------
-def mbps_to_bps(x_mbps: float) -> float:
-    return float(x_mbps) * 1e6
-
-def ms_to_sec(x_ms: float) -> float:
-    return float(x_ms) / 1000.0
-
-# -------------------------
-# config dataclasses
-# -------------------------
+# ----------------------------
+# Data classes
+# ----------------------------
 @dataclass
-class EpisodeTiming:
-    Delta: float        # seconds per slot (keep same as dataset)
-    T_slots: int        # used for consistency/meta; no dynamics here
+class TopologyHyper:
+    number_of_servers: int              # K (MEC count)
+    time_step: float                    # Δ (sec per slot)
 
-@dataclass
-class MECCompute:
-    f_mec_min: float    # Hz
-    f_mec_max: float    # Hz
+    # ----- Compute capacities (per second); we scale by Δ -> per slot
+    private_cpu_min: Optional[float] = None
+    private_cpu_max: Optional[float] = None
+    public_cpu_min: Optional[float] = None
+    public_cpu_max: Optional[float] = None
 
-@dataclass
-class CloudCompute:
-    f_cloud: float      # Hz (single cloud)
+    # If you don't have separate ranges, provide totals + public_share in [0,1]
+    cpu_total_min: Optional[float] = None
+    cpu_total_max: Optional[float] = None
+    public_share: Optional[float] = None
 
-@dataclass
-class EdgeToMECLink:
-    bandwidth_mbps: float
-    latency_ms: float
+    # Cloud capacity (per second) — fixed or range
+    cloud_capacity: Optional[float] = None
+    cloud_capacity_min: Optional[float] = None
+    cloud_capacity_max: Optional[float] = None
 
-@dataclass
-class MECToCloudLink:
-    latency_ms: float   # capacity sampled by topology model per-MEC
+    # ----- Links (per second); we scale by Δ -> per slot
+    horiz_cap_min: float = 8.0         # MB/s (MEC↔MEC)
+    horiz_cap_max: float = 12.0
+    cloud_cap_min: float = 50.0        # MB/s (MEC→Cloud)
+    cloud_cap_max: float = 200.0
 
-@dataclass
-class MECToMECLink:
-    latency_ms: float   # capacity sampled by topology model per-pair
+    # ----- Generator
+    topology_type: str = "skip_connections"  # 'fully_connected' | 'skip_connections'
+    skip_k: int = 5
+    symmetric: bool = True
 
-@dataclass
-class CapacitySampler:
-    """Capacity sampler settings for HOODIE-style generators."""
-    # common min/max for all horizontal MEC↔MEC capacities (in Mbps)
-    horiz_min_mbps: float
-    horiz_max_mbps: float
-    # common min/max for vertical MEC→Cloud capacities (in Mbps)
-    vert_min_mbps: float
-    vert_max_mbps: float
-    # distribution: "uniform" | "loguniform"
-    distribution: str = "uniform"
-    symmetric: bool = True  # whether MEC↔MEC capacities should be symmetric
+    # ----- RNG
+    seed: int = 2025
 
-@dataclass
-class TopologyConfig:
-    name: str
-    seed: int
-    # layers
-    K_MEC: int
-    # timing (match dataset meta for consistency)
-    timing: EpisodeTiming
-    # compute
-    mec_compute: MECCompute
-    cloud_compute: CloudCompute
-    # links
-    edge2mec: EdgeToMECLink
-    mec2cloud: MECToCloudLink
-    mec2mec: MECToMECLink
-    # capacity generator
-    caps: CapacitySampler
-    # style: "fully_connected" | "skip_connections"
-    style: str = "fully_connected"
-    skip_connections: int = 2  # used if style == "skip_connections"
-
-# -------------------------
-# capacity samplers (HOODIE-like)
-# -------------------------
-def _sample_capacity(rng, lo_mbps: float, hi_mbps: float, dist: str) -> float:
-    lo, hi = float(lo_mbps), float(hi_mbps)
-    if dist == "loguniform":
-        lo_ = np.log(max(lo, 1e-6))
-        hi_ = np.log(max(hi, lo + 1e-6))
-        return float(np.exp(rng.uniform(lo_, hi_)))
-    # default: uniform
-    return float(rng.uniform(lo, hi))
-
-def build_connection_matrix(cfg: TopologyConfig, rng: np.random.Generator) -> np.ndarray:
-    """
-    Returns a (#MEC) x (#MEC + 1) matrix:
-      cols 0..K_MEC-1  : horizontal MEC↔MEC capacities (Mbps)
-      col  K_MEC       : vertical MEC→Cloud capacities (Mbps)
-    style: fully_connected or skip_connections
-    """
-    K = cfg.K_MEC
-    M = np.zeros((K, K + 1), dtype=float)
-
-    # vertical capacities MEC->Cloud
-    for i in range(K):
-        M[i, K] = _sample_capacity(
-            rng, cfg.caps.vert_min_mbps, cfg.caps.vert_max_mbps, cfg.caps.distribution
-        )
-
-    # horizontal capacities MEC<->MEC
-    if cfg.style == "fully_connected":
-        for i in range(K):
-            for j in range(K):
-                if i == j: 
-                    continue
-                cap = _sample_capacity(
-                    rng, cfg.caps.horiz_min_mbps, cfg.caps.horiz_max_mbps, cfg.caps.distribution
-                )
-                M[i, j] = cap
-                if cfg.caps.symmetric:
-                    M[j, i] = cap
-    else:  # skip_connections
-        step = max(1, int(cfg.skip_connections))
-        for i in range(K):
-            j = (i + step) % K
-            if i != j:
-                cap = _sample_capacity(
-                    rng, cfg.caps.horiz_min_mbps, cfg.caps.horiz_max_mbps, cfg.caps.distribution
-                )
-                M[i, j] = cap
-                if cfg.caps.symmetric:
-                    M[j, i] = cap
-
-    return M
-
-# -------------------------
-# IO helpers
-# -------------------------
-def _fingerprint(obj: dict) -> str:
+# ----------------------------
+# Utils
+# ----------------------------
+def _fp(obj: dict) -> str:
     s = json.dumps(obj, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
 
-def save_csv(df: pd.DataFrame, path: str) -> str:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False)
-    return path
-
-def save_json(obj: dict, path: str) -> str:
+def _save_json(obj: dict, path: str) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     return path
 
-# -------------------------
-# main builder
-# -------------------------
-def build_topology(cfg: TopologyConfig,
-                   agents_csv: str,
-                   out_dir: str = "./topology") -> Dict[str, str]:
+def _save_text(text: str, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+def _save_matrix_csv(M: np.ndarray, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # header: mec_0,...,mec_{K-1}, cloud
+    K = M.shape[0]
+    header = [f"mec_{i}" for i in range(K)] + ["cloud"]
+    lines = [",".join([""] + header)]
+    for i in range(K):
+        row = ",".join([f"mec_{i}"] + [str(float(x)) for x in M[i, :]])
+        lines.append(row)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+# ----------------------------
+# Builders
+# ----------------------------
+def _sample_cloud_capacity(h: TopologyHyper, rng: np.random.Generator) -> float:
+    if h.cloud_capacity is not None:
+        return float(h.cloud_capacity)
+    if h.cloud_capacity_min is not None and h.cloud_capacity_max is not None:
+        return float(rng.uniform(h.cloud_capacity_min, h.cloud_capacity_max))
+    return 3.0e10  # fallback per-second
+
+def _build_compute_caps(h: TopologyHyper, rng: np.random.Generator):
+    K = h.number_of_servers
+    if (h.private_cpu_min is not None and h.private_cpu_max is not None and
+        h.public_cpu_min  is not None and h.public_cpu_max  is not None):
+        priv_sec = rng.uniform(h.private_cpu_min, h.private_cpu_max, size=K)
+        pub_sec  = rng.uniform(h.public_cpu_min,  h.public_cpu_max,  size=K)
+    else:
+        tot_sec  = rng.uniform(float(h.cpu_total_min or 2.0e9),
+                               float(h.cpu_total_max or 3.0e9),
+                               size=K)
+        share = float(h.public_share if h.public_share is not None else 0.3)
+        pub_sec  = tot_sec * share
+        priv_sec = tot_sec - pub_sec
+
+    priv_slot = (priv_sec * h.time_step).astype(float).tolist()
+    pub_slot  = (pub_sec  * h.time_step).astype(float).tolist()
+    return priv_slot, pub_slot
+
+def _build_connection_matrix(h: TopologyHyper, rng: np.random.Generator):
     """
-    Build topology files for section 5.2.2
-    - agents_csv: the CSV from your dataset generator (per scenario), to import f_local per agent.
+    Returns M of shape (K, K+1), MB/slot.
+    cols 0..K-1 : MEC↔MEC horizontal capacities
+    col  K      : MEC→Cloud vertical capacity
     """
-    rng = np.random.default_rng(cfg.seed)
-    os.makedirs(out_dir, exist_ok=True)
+    K = h.number_of_servers
+    M = np.zeros((K, K + 1), dtype=float)
 
-    # --- load agents to get Edge nodes & f_local
-    agents_df = pd.read_csv(agents_csv)
-    if "agent_id" not in agents_df.columns:
-        raise ValueError("agents.csv must contain 'agent_id' column")
-    # optional fallbacks
-    if "f_local" not in agents_df.columns:
-        # if missing, set a default or raise error
-        agents_df["f_local"] = 1.5e9  # Hz default
-    if "m_local" not in agents_df.columns:
-        agents_df["m_local"] = 4e9     # bytes or MB; just for meta
+    # vertical MEC→Cloud (per slot)
+    for i in range(K):
+        cap_sec = rng.uniform(h.cloud_cap_min, h.cloud_cap_max)
+        M[i, K] = float(cap_sec * h.time_step)
 
-    # --- MEC compute
-    mec_ids = [f"MEC_{i}" for i in range(cfg.K_MEC)]
-    f_mec = rng.uniform(cfg.mec_compute.f_mec_min, cfg.mec_compute.f_mec_max, size=cfg.K_MEC)
+    # horizontal MEC↔MEC (per slot)
+    if h.topology_type == "fully_connected":
+        for i in range(K):
+            for j in range(K):
+                if i == j:
+                    continue
+                cap_sec = rng.uniform(h.horiz_cap_min, h.horiz_cap_max)
+                M[i, j] = float(cap_sec * h.time_step)
+        if h.symmetric:
+            M[:, :K] = np.maximum(M[:, :K], M[:, :K].T)
+    else:  # skip_connections
+        step = max(1, int(h.skip_k))
+        for i in range(K):
+            for s in range(1, step + 1):
+                j = (i + s) % K
+                if i == j:
+                    continue
+                cap_sec = rng.uniform(h.horiz_cap_min, h.horiz_cap_max)
+                M[i, j] = float(cap_sec * h.time_step)
+                if h.symmetric:
+                    M[j, i] = M[i, j]
 
-    # --- Cloud compute
-    cloud_id = "CLOUD"
-    f_cloud = cfg.cloud_compute.f_cloud
+    return M
 
-    # --- connection matrix (HOODIE-like)
-    C = build_connection_matrix(cfg, rng)   # Mbps
+# ----------------------------
+# Graph drawing (optional)
+# ----------------------------
+def _draw_graph_png(M: np.ndarray,
+                    out_png: str,
+                    title: str = "MEC Graph (MB/slot)",
+                    with_cloud: bool = True):
+    """
+    Draw an undirected MEC↔MEC graph + (optionally) MEC→Cloud spokes.
+    Edge labels show capacity (MB/slot). Cloud drawn on top.
+    """
+    if not _GRAPH_OK:
+        return None
 
-    # ========== nodes.csv ==========
-    nodes_rows = []
-    # Edge nodes
-    for _, r in agents_df.iterrows():
-        nodes_rows.append({
-            "node_id": f"EDGE_{int(r['agent_id'])}",
-            "layer": "edge",
-            "cpu_hz": float(r["f_local"]),
-            "queue_policy": "FCFS",
-            "queue_capacity": "inf"
-        })
+    K = M.shape[0]
+    G = nx.Graph()
+
     # MEC nodes
-    for i, mec in enumerate(mec_ids):
-        nodes_rows.append({
-            "node_id": mec,
-            "layer": "mec",
-            "cpu_hz": float(f_mec[i]),
-            "queue_policy": "FCFS",
-            "queue_capacity": "inf"
-        })
-    # Cloud node
-    nodes_rows.append({
-        "node_id": cloud_id,
-        "layer": "cloud",
-        "cpu_hz": float(f_cloud),
-        "queue_policy": "FCFS",
-        "queue_capacity": "inf"
-    })
-    nodes_df = pd.DataFrame(nodes_rows)
+    for i in range(K):
+        G.add_node(f"MEC_{i}", layer="mec")
 
-    # ========== routing.csv (Edge→MEC assignment) ==========
-    # simple stable mapping: agent_id % K_MEC
-    routing_rows = []
-    for _, r in agents_df.iterrows():
-        aid = int(r["agent_id"])
-        mec_idx = aid % cfg.K_MEC
-        routing_rows.append({
-            "agent_id": aid,
-            "mec_id": mec_ids[mec_idx],
-            "rule": "agent_id_mod_KMEC"
-        })
-    routing_df = pd.DataFrame(routing_rows)
+    # MEC↔MEC edges (only upper triangle to avoid duplicates)
+    for i in range(K):
+        for j in range(i + 1, K):
+            cap = max(M[i, j], M[j, i])
+            if cap > 0:
+                G.add_edge(f"MEC_{i}", f"MEC_{j}", weight=cap)
 
-    # ========== links.csv ==========
-    links_rows = []
+    # Positions: circular for MEC
+    pos = nx.circular_layout([f"MEC_{i}" for i in range(K)])
 
-    # Edge→MEC links (fixed capacity & latency)
-    bw_e2m_bps = mbps_to_bps(cfg.edge2mec.bandwidth_mbps)
-    lat_e2m_s  = ms_to_sec(cfg.edge2mec.latency_ms)
-    for _, r in routing_df.iterrows():
-        src = f"EDGE_{int(r['agent_id'])}"
-        dst = r["mec_id"]
-        links_rows.append({
-            "src": src, "dst": dst,
-            "bandwidth_bps": bw_e2m_bps,
-            "latency_sec": lat_e2m_s,
-            "kind": "edge_to_mec"
-        })
+    # Optionally add cloud as a separate node
+    if with_cloud:
+        G.add_node("CLOUD", layer="cloud")
+        # place cloud slightly above center
+        pos["CLOUD"] = np.array([0.0, 1.25])
+        for i in range(K):
+            cap_cloud = M[i, K]
+            if cap_cloud > 0:
+                G.add_edge(f"MEC_{i}", "CLOUD", weight=cap_cloud)
 
-    # MEC↔MEC horizontal links (from matrix C, columns 0..K-1)
-    lat_m2m_s  = ms_to_sec(cfg.mec2mec.latency_ms)
-    for i, src_mec in enumerate(mec_ids):
-        for j, dst_mec in enumerate(mec_ids):
-            if i == j:
-                continue
-            cap_mbps = C[i, j]
-            if cap_mbps <= 0:
-                continue
-            links_rows.append({
-                "src": src_mec, "dst": dst_mec,
-                "bandwidth_bps": mbps_to_bps(cap_mbps),
-                "latency_sec": lat_m2m_s,
-                "kind": "mec_to_mec"
-            })
+    # Draw
+    plt.figure(figsize=(7, 7))
+    nx.draw_networkx_nodes(G, pos, nodelist=[n for n, d in G.nodes(data=True) if d.get("layer")=="mec"])
+    if with_cloud:
+        nx.draw_networkx_nodes(G, pos, nodelist=["CLOUD"], node_shape="s")
 
-    # MEC→Cloud vertical links (from matrix C, last column)
-    lat_m2c_s  = ms_to_sec(cfg.mec2cloud.latency_ms)
-    for i, src_mec in enumerate(mec_ids):
-        cap_mbps = C[i, cfg.K_MEC]     # vertical col
-        links_rows.append({
-            "src": src_mec, "dst": cloud_id,
-            "bandwidth_bps": mbps_to_bps(cap_mbps),
-            "latency_sec": lat_m2c_s,
-            "kind": "mec_to_cloud"
-        })
+    # MEC↔MEC edges
+    edges_mm = [(u,v) for u,v in G.edges() if "CLOUD" not in (u,v)]
+    nx.draw_networkx_edges(G, pos, edgelist=edges_mm)
 
-    links_df = pd.DataFrame(links_rows)
+    # MEC→Cloud edges
+    edges_mc = [(u,v) for u,v in G.edges() if "CLOUD" in (u,v)]
+    nx.draw_networkx_edges(G, pos, edgelist=edges_mc, style="dashed")
 
-    # ========== meta ==========
+    # labels
+    nx.draw_networkx_labels(G, pos, font_size=9)
+
+    # Edge labels with capacities
+    edge_labels = {(u,v): f"{G[u][v]['weight']:.1f}" for u,v in G.edges()}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+
+    plt.title(title)
+    plt.axis("off")
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    return out_png
+
+# ----------------------------
+# Report (Markdown)
+# ----------------------------
+def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out_md: str):
+    K = topo["number_of_servers"]
+    units = meta.get("units", {})
+    compute_unit = units.get("compute", "CPU cycles per slot")
+    link_unit = units.get("links", "MB per slot")
+    time_unit = units.get("time_step", "seconds")
+
+    priv = topo["private_cpu_capacities"]
+    pub  = topo["public_cpu_capacities"]
+    cloud = topo["cloud_computational_capacity"]
+
+    # Simple summaries
+    def s(lst): 
+        if not lst: return "n/a"
+        arr = np.array(lst, dtype=float)
+        return f"min={arr.min():.3g}, mean={arr.mean():.3g}, max={arr.max():.3g}"
+
+    M = np.array(topo["connection_matrix"], dtype=float)
+    horiz = M[:, :K]
+    vert  = M[:, K]
+
+    md = []
+    md.append(f"# Topology Report\n")
+    md.append(f"- **Servers (MEC)**: {K}")
+    md.append(f"- **Time step (Δ)**: {topo['time_step']} {time_unit}")
+    md.append(f"- **Topology type**: {topo.get('topology_type','n/a')}, **skip_k**: {topo.get('skip_k','-')}, **symmetric**: {topo.get('symmetric','-')}")
+    md.append("")
+    md.append(f"## Compute Capacities ({compute_unit})")
+    md.append(f"- Private (per MEC): {s(priv)}")
+    md.append(f"- Public  (per MEC): {s(pub)}")
+    md.append(f"- Cloud (single): {cloud:.3g}")
+    md.append("")
+    md.append(f"## Link Capacities ({link_unit})")
+    md.append(f"- Horizontal MEC↔MEC (non-zero entries): {int((horiz>0).sum())}")
+    md.append(f"- MEC→Cloud (length K): min={vert.min():.3g}, mean={vert.mean():.3g}, max={vert.max():.3g}")
+    md.append("")
+    if graph_png:
+        md.append(f"## Graph")
+        md.append(f"![Topology Graph]({os.path.basename(graph_png)})")
+        md.append("")
+    md.append("## Notes")
+    md.append("- Values are per slot; per-slot = per-second × Δ.")
+    md.append(f"- Units: compute={compute_unit}, links={link_unit}, time_step={time_unit}.")
+    md_txt = "\n".join(md)
+    _save_text(md_txt, out_md)
+    return out_md
+
+# ----------------------------
+# Main builder
+# ----------------------------
+def build_topology(h: TopologyHyper,
+                   out_topology: str = "./topology/topology.json",
+                   out_meta: str = "./topology/topology_meta.json") -> Dict[str, str]:
+    rng = np.random.default_rng(h.seed)
+
+    # compute
+    private_caps, public_caps = _build_compute_caps(h, rng)
+    cloud_cap_sec = _sample_cloud_capacity(h, rng)
+    cloud_cap = float(cloud_cap_sec * h.time_step)  # per-slot
+
+    # links
+    M = _build_connection_matrix(h, rng)
+
+    # HOODIE-compatible payload
+    topo = {
+        "number_of_servers": h.number_of_servers,
+        "private_cpu_capacities": private_caps,     # cycles/slot
+        "public_cpu_capacities": public_caps,       # cycles/slot
+        "cloud_computational_capacity": cloud_cap,  # cycles/slot
+        "connection_matrix": M.tolist(),            # MB/slot
+        "time_step": h.time_step,
+        "topology_type": h.topology_type,
+        "skip_k": h.skip_k,
+        "symmetric": h.symmetric
+    }
     meta = {
-        "schema_version": "1.0.0",
-        "name": cfg.name,
-        "seed": cfg.seed,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fingerprint": _fp(topo),
         "env": {"python": platform.python_version(), "user": getpass.getuser()},
-        "timing": asdict(cfg.timing),
-        "K_MEC": cfg.K_MEC,
-        "compute": {
-            "edge_f_local_source": "agents.csv (dataset)",
-            "mec_compute": asdict(cfg.mec_compute),
-            "cloud_compute": asdict(cfg.cloud_compute)
-        },
-        "links": {
-            "edge2mec": asdict(cfg.edge2mec),
-            "mec2mec": asdict(cfg.mec2mec),
-            "mec2cloud": asdict(cfg.mec2cloud),
-            "capacity_sampler": asdict(cfg.caps),
-            "style": cfg.style,
-            "skip_connections": cfg.skip_connections
-        },
         "units": {
-            "cpu_hz": "Hz",
-            "bandwidth_bps": "bits per second",
-            "bandwidth_input_mbps": "Mbps (converted to bps)",
-            "latency_sec": "seconds",
-            "latency_input_ms": "milliseconds"
+            "compute": "CPU cycles per slot",
+            "links": "MB per slot",
+            "time_step": "seconds"
+        },
+        "notes": {
+            "inputs_unit": {"compute": "CPU cycles per second", "links": "MB per second"},
+            "conversion": "per_slot = per_second * time_step"
         }
     }
-    meta["fingerprint"] = _fingerprint(meta)
 
-    # ========== save ==========
-    paths = {}
-    paths["nodes_csv"]    = save_csv(nodes_df, os.path.join(out_dir, "nodes.csv"))
-    paths["links_csv"]    = save_csv(links_df, os.path.join(out_dir, "links.csv"))
-    paths["routing_csv"]  = save_csv(routing_df, os.path.join(out_dir, "routing.csv"))
-    paths["topo_meta"]    = save_json(meta, os.path.join(out_dir, "topology_meta.json"))
+    # Save core outputs
+    _save_json(topo, out_topology)
+    _save_json(meta, out_meta)
 
-    return paths
+    # Extras (do NOT change core structure)
+    out_dir = os.path.dirname(out_topology) or "."
+    cm_csv = os.path.join(out_dir, "connection_matrix.csv")
+    _save_matrix_csv(M, cm_csv)
 
-# -------------------------
-# example usage
-# -------------------------
-if __name__ == "__main__":
-    # Example config (put real numbers after you paste HOODIE's hyperparameters)
-    cfg = TopologyConfig(
-        name="moderate_topology",
-        seed=20251026,
-        K_MEC=3,
-        timing=EpisodeTiming(Delta=1.0, T_slots=3600),
-        mec_compute=MECCompute(f_mec_min=4.0e9, f_mec_max=6.0e9),
-        cloud_compute=CloudCompute(f_cloud=20.0e9),
-        edge2mec=EdgeToMECLink(bandwidth_mbps=50.0, latency_ms=10.0),
-        mec2cloud=MECToCloudLink(latency_ms=25.0),
-        mec2mec=MECToMECLink(latency_ms=5.0),
-        caps=CapacitySampler(
-            horiz_min_mbps=200.0, horiz_max_mbps=800.0,
-            vert_min_mbps=500.0,  vert_max_mbps=2000.0,
-            distribution="uniform",
-            symmetric=True
-        ),
-        style="fully_connected",     # or "skip_connections"
-        skip_connections=2
+    graph_png = None
+    if _GRAPH_OK:
+        graph_png = os.path.join(out_dir, "topology_graph.png")
+        _draw_graph_png(M, graph_png, title="MEC Graph (MB/slot)", with_cloud=True)
+
+    report_md = os.path.join(out_dir, "topology_report.md")
+    _write_markdown_report(topo, meta, graph_png, report_md)
+
+    return {
+        "topology_json": out_topology,
+        "meta_json": out_meta,
+        "connection_matrix_csv": cm_csv,
+        "graph_png": graph_png if graph_png else "",
+        "report_md": report_md
+    }
+
+# ----------------------------
+# Quick CLI example
+# ----------------------------
+def build_from_hyperparameters_json(hparams_path: str,
+                                    out_dir: str = "./topology") -> Dict[str, str]:
+    with open(hparams_path, "r", encoding="utf-8") as f:
+        hp = json.load(f)
+
+    th = TopologyHyper(
+        number_of_servers = int(hp.get("number_of_servers", 18)),
+        time_step         = float(hp.get("time_step", 1.0)),
+        private_cpu_min   = hp.get("private_cpu_min"),
+        private_cpu_max   = hp.get("private_cpu_max"),
+        public_cpu_min    = hp.get("public_cpu_min"),
+        public_cpu_max    = hp.get("public_cpu_max"),
+        cpu_total_min     = hp.get("cpu_total_min"),
+        cpu_total_max     = hp.get("cpu_total_max"),
+        public_share      = hp.get("public_share"),
+        cloud_capacity    = hp.get("cloud_capacity"),
+        cloud_capacity_min= hp.get("cloud_capacity_min"),
+        cloud_capacity_max= hp.get("cloud_capacity_max"),
+        horiz_cap_min     = float(hp.get("horizontal_capacities_min", 8.0)),
+        horiz_cap_max     = float(hp.get("horizontal_capacities_max", 12.0)),
+        cloud_cap_min     = float(hp.get("cloud_capacities_min", 50.0)),
+        cloud_cap_max     = float(hp.get("cloud_capacities_max", 200.0)),
+        topology_type     = hp.get("topology_type", "skip_connections"),
+        skip_k            = int(hp.get("skip_k", 5)),
+        symmetric         = bool(hp.get("symmetric", True)),
+        seed              = int(hp.get("seed", 2025))
     )
 
-    # point to your dataset's agents.csv (e.g., datasets/moderate/moderate_ep0_agents.csv)
-    AGENTS_CSV = "./datasets/moderate/moderate_ep0_agents.csv"
-    out = build_topology(cfg, agents_csv=AGENTS_CSV, out_dir="./topology/moderate")
-    print(json.dumps(out, indent=2))
+    os.makedirs(out_dir, exist_ok=True)
+    return build_topology(
+        th,
+        out_topology=os.path.join(out_dir, "topology.json"),
+        out_meta=os.path.join(out_dir, "topology_meta.json")
+    )
+
+if __name__ == "__main__":
+    H = TopologyHyper(
+        number_of_servers=18,
+        time_step=1.0,
+        private_cpu_min=1.2e9, private_cpu_max=1.8e9,   # cycles/s
+        public_cpu_min=0.5e9,  public_cpu_max=0.9e9,    # cycles/s
+        cloud_capacity=3.0e10,                          # cycles/s
+        horiz_cap_min=8.0, horiz_cap_max=12.0,          # MB/s
+        cloud_cap_min=80.0, cloud_cap_max=120.0,        # MB/s
+        topology_type="skip_connections", skip_k=5, symmetric=True,
+        seed=20251026
+    )
+    build_topology(H, out_topology="./topology/topology.json",
+                      out_meta="./topology/topology_meta.json")
