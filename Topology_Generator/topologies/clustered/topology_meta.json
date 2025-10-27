@@ -1,0 +1,20 @@
+{
+  "generated_at_utc": "2025-10-27T10:27:09Z",
+  "fingerprint": "9a3a6cc2768b6834",
+  "env": {
+    "python": "3.10.9",
+    "user": "niush"
+  },
+  "units": {
+    "compute": "CPU cycles per slot",
+    "links": "MB per slot",
+    "time_step": "seconds"
+  },
+  "notes": {
+    "inputs_unit": {
+      "compute": "CPU cycles per second",
+      "links": "MB per second"
+    },
+    "conversion": "per_slot = per_second * time_step"
+  }
+}
