@@ -101,9 +101,7 @@ def lognormal_from_median_sigma_g(rng, median: float, sigma_g: float, qcap: floa
         cap = lognormal_quantile(median, sigma_g, qcap if qcap in (0.99, 0.999) else 0.99)
         x = min(x, cap)
     return x
-  
-  
-  
+
 
 # -------------------------
 # entities
