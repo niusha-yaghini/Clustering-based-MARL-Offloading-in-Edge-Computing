@@ -1,0 +1,37 @@
+{
+  "scenario": "moderate",
+  "seed": 244,
+  "Delta": 1.0,
+  "T_slots": 3600,
+  "N_agents": 18,
+  "AgentRanges": {
+    "lam_sec_min": 0.05,
+    "lam_sec_max": 0.2,
+    "f_local_min": 800000000.0,
+    "f_local_max": 2400000000.0,
+    "m_local_min": 3000000000.0,
+    "m_local_max": 8000000000.0
+  },
+  "TaskDist": {
+    "b_median": 3.0,
+    "b_sigma_g": 0.6,
+    "rho_median": 1200000000.0,
+    "rho_sigma_g": 0.5,
+    "mem_median": 64.0,
+    "mem_sigma_g": 0.5,
+    "p_deadline": 0.25,
+    "deadline_min": 0.5,
+    "deadline_max": 1.5,
+    "p_non_atomic": 0.35,
+    "split_ratio_min": 0.3,
+    "split_ratio_max": 0.8
+  },
+  "notes": {
+    "rates_unit": "lam_sec is per-second; per-slot rate = lam_sec * Delta",
+    "b_unit": "MB",
+    "rho_unit": "cycles per MB",
+    "c_unit": "cycles",
+    "deadline_s": "relative seconds; deadline_time = t_arrival_time + deadline_s",
+    "non_atomic": "1 means task can be split; split_ratio = fraction of size that can be split"
+  }
+}
