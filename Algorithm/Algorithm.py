@@ -9,7 +9,7 @@ from typing import Dict, Any, Tuple
 
 # Step 1: Prepare data and configure the environment
 
-# 1. Data Loading (Data I/O)
+# 1.1. Data Loading (Data I/O)
 
 # Define the base directories
 dataset_dir = '../Data_Generator/datasets'
@@ -120,7 +120,6 @@ else:
     print("[error] no datasets found or requested scenario is missing for the chosen episode.")
 
 
-
 # Loading topology
 topologies = {}
 
@@ -168,7 +167,9 @@ print(topologies['clustered']['meta_data'])
 
 
 
-# 2. Data Validation (episode-first aware)
+
+
+# 1.2. Data Validation (episode-first aware)
 
 # ---------- Generic helpers ----------
 def _require(cond: bool, msg: str, errors: list):
@@ -443,7 +444,9 @@ if not all_ok:
 
 
 
-# 3. Units Alignment (episode-first aware)
+
+
+# 1.3. Units Alignment (episode-first aware)
 
 # In this section, we align units for all dataset episodes and scenarios
 # and run consistency checks against all topologies.
@@ -647,7 +650,8 @@ print_alignment_summary_episode_first(result_align)
 
 
 
-# 4. Build Scenario–Topology Pairs (episode-first aware)
+
+# 1.4. Build Scenario–Topology Pairs (episode-first aware)
 
 # We pair every (episode, scenario) dataset with every topology.
 # Output shape:
@@ -785,7 +789,9 @@ print_pairs_summary_topology_first_ep(pairs_by_topology)
 
 
 
-# 5. Agent→MEC mapping (for all pairs) — 3-level: topology → episode → scenario
+
+
+# 1.5. Agent→MEC mapping (for all pairs) — 3-level: topology → episode → scenario
 
 def assign_agents_to_mecs(pairs_by_topology):
     """
@@ -976,7 +982,8 @@ env_configs = build_all_env_configs(pairs_by_topology)
 
 
 
-# 6. Environment Configuration
+
+# 1.6. Environment Configuration
 
 # In this step, we build a unified env_config for each scenario–topology pair.
 # It bundles all required information for the MDP/RL environment—such as compute capacities,
@@ -1042,7 +1049,7 @@ def _derive_state_spec(K: int) -> Dict[str, Any]:
         },
         "note": "Declarative spec; tensor assembly happens in the Env at each step."
     }
-
+    
 def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     core = _extract_core_from_bundle(bundle)
 
@@ -1054,7 +1061,6 @@ def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         # reorder by agent_id if needed
         if agent_to_mec.index.name != "agent_id":
             agent_to_mec.index.name = "agent_id"
-        # enforce index = 0..N_agents-1
         idx = core["agents"].sort_values("agent_id")["agent_id"].to_numpy()
         agent_to_mec = agent_to_mec.reindex(idx)
         agent_to_mec_arr = agent_to_mec.to_numpy(dtype=int)
@@ -1065,7 +1071,7 @@ def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     if len(agent_to_mec_arr) != N_agents:
         raise ValueError(f"agent_to_mec length ({len(agent_to_mec_arr)}) != N_agents ({N_agents}).")
 
-    queues_init = _build_default_queues(core["K"])
+    queues_init  = _build_default_queues(core["K"])
     action_space = _derive_action_space()
     state_spec   = _derive_state_spec(core["K"])
 
@@ -1082,7 +1088,7 @@ def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         "N_agents": N_agents,
         "agent_to_mec": agent_to_mec_arr,
 
-        # aligned dataframes (include f_local_slot, deadline_slots if شما قبلاً افزوده‌اید)
+        # aligned dataframes
         "episodes": core["episodes"],
         "agents":   core["agents"],
         "arrivals": core["arrivals"],
@@ -1096,25 +1102,38 @@ def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     }
     return env_config
 
-def build_all_env_configs(pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
+
+def build_all_env_configs(
+    pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
     """
     Build env_config for every (topology / episode / scenario) bundle.
 
-    Output shape:
-        env_configs[topology][episode][scenario] = env_config
+    Desired output shape (EPISODE-first):
+        env_configs[episode][topology][scenario] = env_config
+
+    So you can access:
+        env_configs["ep_000"]["clustered"]["heavy"]["agent_to_mec"]
     """
     out: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    # pairs_by_topology: topo -> ep -> scen -> bundle
     for topo_name, by_ep in pairs_by_topology.items():
-        out[topo_name] = {}
         for ep_name, by_scen in by_ep.items():
-            out[topo_name][ep_name] = {}
+            # ensure episode level exists
+            if ep_name not in out:
+                out[ep_name] = {}
+            # ensure topology level under this episode exists
+            if topo_name not in out[ep_name]:
+                out[ep_name][topo_name] = {}
             for scen_name, bundle in by_scen.items():
                 if "agent_to_mec" not in bundle:
-                    raise RuntimeError(f"[{topo_name}/{ep_name}/{scen_name}] missing 'agent_to_mec'. Run Stage 5 first.")
+                    raise RuntimeError(
+                        f"[{topo_name}/{ep_name}/{scen_name}] missing 'agent_to_mec'. Run Stage 5 first."
+                    )
                 env_cfg = build_env_config_for_bundle(bundle)
-                out[topo_name][ep_name][scen_name] = env_cfg
+                out[ep_name][topo_name][scen_name] = env_cfg
     return out
+
 
 # Build
 env_configs = build_all_env_configs(pairs_by_topology)
@@ -1126,7 +1145,7 @@ env_configs["clustered"]["ep_000"]["heavy"]["agent_to_mec"]
 
 
 
-# 7. Sanity Checks
+# 1.7. Sanity Checks
 
 # In this step, we verify that each env_config is internally consistent 
     # (queue shapes, capacities, agent→MEC mapping, and connection matrix are valid and ready for simulation).
@@ -1184,5 +1203,330 @@ def sanity_check_all(env_configs):
 
 # Run all sanity checks
 sanity_check_all(env_configs)
+
+
+# At Step 1, we have loaded the data, aligned the units, assigned agents to MECs, 
+# and prepared the environment configuration. Finally, we have performed consistency checks to ensure the data is correct. 
+# Next, we can move on to task labeling.
+
+
+
+
+
+# Step 2: Task Labeling
+
+# 2.1. Basic Task Labeling (buckets, urgency, atomicity, ...)
+
+# ---------- helpers: quantile-based cut points ----------
+def _quantile_cutpoints(s: pd.Series, q_low=0.33, q_high=0.66) -> Tuple[float, float]:
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if len(s) == 0:
+        return (np.nan, np.nan)
+    return (float(s.quantile(q_low)), float(s.quantile(q_high)))
+
+def _bucketize(value: float, q1: float, q2: float) -> str:
+    # Returns 'S', 'M', 'L' based on two cut points (q1<=q2)
+    if not np.isfinite(value) or not np.isfinite(q1) or not np.isfinite(q2):
+        return "U"  # Unknown
+    if value <= q1: return "S"
+    if value <= q2: return "M"
+    return "L"
+
+# ---------- threshold builder (adaptive to each tasks DF) ----------
+def build_task_label_thresholds(tasks_df: pd.DataFrame,
+                                q_low=0.33, q_high=0.66,
+                                urgent_slots_cap: int = 2) -> Dict[str, Any]:
+    """
+    Build adaptive thresholds from the data itself (per-episode/senario),
+    so 'light/moderate/heavy' are handled robustly.
+    """
+    q_b_mb   = _quantile_cutpoints(tasks_df["b_mb"], q_low, q_high) if "b_mb" in tasks_df else (np.nan, np.nan)
+    q_rho    = _quantile_cutpoints(tasks_df["rho_cyc_per_mb"], q_low, q_high) if "rho_cyc_per_mb" in tasks_df else (np.nan, np.nan)
+    q_mem    = _quantile_cutpoints(tasks_df["mem_mb"], q_low, q_high) if "mem_mb" in tasks_df else (np.nan, np.nan)
+    q_split  = _quantile_cutpoints(tasks_df.loc[tasks_df.get("non_atomic", 0)==1, "split_ratio"], q_low, q_high) \
+               if "split_ratio" in tasks_df else (np.nan, np.nan)
+
+    return {
+        "b_mb":   {"q1": q_b_mb[0],  "q2": q_b_mb[1]},
+        "rho":    {"q1": q_rho[0],   "q2": q_rho[1]},
+        "mem":    {"q1": q_mem[0],   "q2": q_mem[1]},
+        "split":  {"q1": q_split[0], "q2": q_split[1]},
+        # If deadline_slots ≤ urgent_slots_cap → 'hard' (latency sensitive)
+        "urgent_slots_cap": int(urgent_slots_cap),
+    }
+
+# ---------- main labeling for a single tasks DF ----------
+def label_tasks_df(tasks_df: pd.DataFrame, Delta: float, thresholds: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Add label columns to tasks_df (returns a COPY).
+    Columns added:
+      - size_bucket, compute_bucket, mem_bucket
+      - deadline_slots (if missing), urgency (none/soft/hard)
+      - atomicity, split_bucket
+      - latency_sensitive, compute_heavy, io_heavy, memory_heavy (bools)
+      - routing_hint (LOCAL/MEC/CLOUD)
+    """
+    df = tasks_df.copy()
+
+    # --- ensure numeric types
+    for col in ["b_mb", "rho_cyc_per_mb", "c_cycles", "mem_mb", "deadline_s", "split_ratio"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # --- deadline_slots (if not precomputed in Units Alignment)
+    if "deadline_slots" not in df.columns:
+        if "has_deadline" in df.columns and "deadline_s" in df.columns:
+            df["deadline_slots"] = np.where(
+                (df["has_deadline"] == 1) & np.isfinite(df["deadline_s"]),
+                np.ceil(df["deadline_s"] / float(Delta)).astype("float"),
+                np.nan
+            )
+        else:
+            df["deadline_slots"] = np.nan
+
+    # --- bucketize size/compute/memory
+    b_q1, b_q2   = thresholds["b_mb"]["q1"], thresholds["b_mb"]["q2"]
+    rho_q1, rho_q2 = thresholds["rho"]["q1"], thresholds["rho"]["q2"]
+    mem_q1, mem_q2 = thresholds["mem"]["q1"], thresholds["mem"]["q2"]
+
+    df["size_bucket"]    = df["b_mb"].apply(lambda x: _bucketize(x, b_q1, b_q2)) if "b_mb" in df else "U"
+    df["compute_bucket"] = df["rho_cyc_per_mb"].apply(lambda x: _bucketize(x, rho_q1, rho_q2)) if "rho_cyc_per_mb" in df else "U"
+    df["mem_bucket"]     = df["mem_mb"].apply(lambda x: _bucketize(x, mem_q1, mem_q2)) if "mem_mb" in df else "U"
+
+    # --- atomicity & split buckets
+    if "non_atomic" in df.columns:
+        df["atomicity"] = np.where(df["non_atomic"] == 1, "splittable", "atomic")
+    else:
+        df["atomicity"] = "atomic"
+
+    if "split_ratio" in df.columns:
+        sp_q1, sp_q2 = thresholds["split"]["q1"], thresholds["split"]["q2"]
+        df["split_bucket"] = np.where(
+            df["atomicity"] == "splittable",
+            df["split_ratio"].apply(lambda v: _bucketize(v, sp_q1, sp_q2)),
+            "NA"
+        )
+    else:
+        df["split_bucket"] = "NA"
+
+    # --- urgency levels
+    urgent_cap = int(thresholds.get("urgent_slots_cap", 2))
+    def _urg(row):
+        if int(row.get("has_deadline", 0)) != 1 or not np.isfinite(row.get("deadline_slots", np.nan)):
+            return "none"
+        slots = int(row["deadline_slots"])
+        if slots <= urgent_cap:  # very tight deadline
+            return "hard"
+        return "soft"
+    df["urgency"] = df.apply(_urg, axis=1)
+
+    # --- boolean convenience labels
+    df["latency_sensitive"] = (df["urgency"] == "hard")
+    df["compute_heavy"]     = (df["compute_bucket"] == "L")
+    df["io_heavy"]          = (df["size_bucket"] == "L")
+    df["memory_heavy"]      = (df["mem_bucket"] == "L")
+
+    # --- a very simple routing hint (only for debugging/EDA; not used by the RL policy)
+    def _hint(row):
+        if row["compute_heavy"] or row["memory_heavy"]:
+            return "CLOUD"
+        if row["latency_sensitive"]:
+            return "MEC"
+        return "LOCAL"
+    df["routing_hint"] = df.apply(_hint, axis=1)
+
+    return df
+
+# ---------- batch apply to env_configs (topology → episode → scenario) ----------
+def label_all_tasks_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+                                   q_low=0.33, q_high=0.66, urgent_slots_cap=2,
+                                   verbose=True) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    For each env_config:
+      - build thresholds from its own tasks DF
+      - label tasks
+      - put labeled DF back into env_config["tasks"]
+      - return a concise summary per bundle
+    """
+    summary = {}
+
+    for topo_name, by_ep in env_configs.items():
+        summary[topo_name] = {}
+        for ep_name, by_scen in by_ep.items():
+            summary[topo_name][ep_name] = {}
+            for scen_name, env_cfg in by_scen.items():
+                tasks = env_cfg["tasks"]
+                Delta = float(env_cfg["Delta"])
+
+                # thresholds adaptive to this bundle
+                th = build_task_label_thresholds(tasks, q_low=q_low, q_high=q_high,
+                                                 urgent_slots_cap=urgent_slots_cap)
+                labeled = label_tasks_df(tasks, Delta=Delta, thresholds=th)
+                env_cfg["tasks"] = labeled  # write back
+
+                # tiny summary
+                cnt = {
+                    "n": len(labeled),
+                    "urg_hard": int((labeled["urgency"] == "hard").sum()),
+                    "splittable": int((labeled["atomicity"] == "splittable").sum()),
+                    "size_L": int((labeled["size_bucket"] == "L").sum()),
+                    "compute_L": int((labeled["compute_bucket"] == "L").sum()),
+                    "mem_L": int((labeled["mem_bucket"] == "L").sum()),
+                }
+                summary[topo_name][ep_name][scen_name] = cnt
+
+                if verbose:
+                    print(f"[label] {topo_name}/{ep_name}/{scen_name} -> "
+                          f"n={cnt['n']}, hard={cnt['urg_hard']}, split={cnt['splittable']}, "
+                          f"sizeL={cnt['size_L']}, compL={cnt['compute_L']}, memL={cnt['mem_L']}")
+
+    return env_configs, summary
+
+
+# env_configs: Produced in Step 6 (structure: episode → topology → scenario)
+env_configs, label_summary = label_all_tasks_in_env_configs(
+    env_configs,
+    q_low=0.33, q_high=0.66, urgent_slots_cap=2,  # tunable thresholds
+    verbose=True
+)
+
+# Example access:
+labeled_tasks = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
+labeled_tasks.head()
+
+
+
+
+
+# 2.2. Task Type Classification
+
+# === Chapter-4 Task Typing (priority rules) ===
+# Pre-req: tasks already labeled by your previous step: 
+#   size_bucket, compute_bucket, mem_bucket, urgency, atomicity, split_bucket, routing_hint, etc.
+
+from typing import Dict, Any
+
+def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list]:
+    """
+    Returns (task_type, task_subtype, type_reason, multi_flags)
+      task_type   ∈ {"deadline_hard","latency_sensitive","compute_intensive","data_intensive","general"}
+      task_subtype: finer note (e.g., "deadline_hard", "deadline_soft", ...)
+      type_reason: short human-readable reason
+      multi_flags: list of boolean tags that were true (for auditing)
+    """
+
+    # Collect boolean flags consistent with your earlier labeling:
+    urgency        = str(row.get("urgency", "none"))         # "hard" | "soft" | "none"
+    latency_flag   = (urgency == "hard") or (urgency == "soft")
+    hard_deadline  = (urgency == "hard")
+
+    compute_heavy  = bool(row.get("compute_heavy", False))   # compute_bucket == "L"
+    memory_heavy   = bool(row.get("memory_heavy", False))    # mem_bucket == "L"
+    io_heavy       = bool(row.get("io_heavy", False))        # size_bucket == "L"
+    non_atomic     = bool(row.get("atomicity", "atomic") == "splittable")
+
+    # Keep all active signals for audit:
+    multi_flags = []
+    if hard_deadline:  multi_flags.append("deadline_hard")
+    elif latency_flag: multi_flags.append("deadline_soft")
+    if compute_heavy:  multi_flags.append("compute_heavy")
+    if memory_heavy:   multi_flags.append("memory_heavy")
+    if io_heavy:       multi_flags.append("io_heavy")
+    if non_atomic:     multi_flags.append("splittable")
+
+    # --- Priority resolution (Chapter 4) ---
+    # 1) Hard deadline dominates everything
+    if hard_deadline:
+        return ("deadline_hard", "deadline_hard", "hard deadline (tight slots)", multi_flags)
+
+    # 2) Latency-sensitive (soft deadlines / delay-sensitive)
+    if latency_flag:
+        return ("latency_sensitive", "deadline_soft", "delay-sensitive (soft deadline)", multi_flags)
+
+    # 3) Compute-intensive (c or rho or mem heavy)
+    #    You may decide whether memory_heavy alone pushes to compute_intensive or creates a separate class.
+    #    Based on Chapter 4 text we map memory_heavy into compute_intensive family.
+    if compute_heavy or memory_heavy:
+        return ("compute_intensive", "compute_or_memory_heavy", "high compute/memory demand", multi_flags)
+
+    # 4) Data-intensive (mainly large input size / high IO pressure)
+    if io_heavy:
+        return ("data_intensive", "large_input_bandwidth", "large data volume / IO heavy", multi_flags)
+
+    # 5) Otherwise general
+    return ("general", "general", "no dominant constraint", multi_flags)
+
+
+def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds Chapter-4 level task classes with priority rules into tasks_df (returns a COPY).
+    Columns added:
+      - task_type            (5-way class)
+      - task_subtype         (finer descriptor)
+      - type_reason          (short textual rationale)
+      - multi_flags          (list of all active boolean traits)
+    """
+    df = tasks_df.copy()
+
+    # Ensure the expected helper columns exist (created in your previous labeling step).
+    required_cols = ["urgency", "compute_heavy", "memory_heavy", "io_heavy", "atomicity"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"apply_ch4_task_typing: missing label columns: {missing}")
+
+    out_type, out_sub, out_reason, out_flags = [], [], [], []
+    for _, r in df.iterrows():
+        t, s, msg, flags = _derive_task_type_row(r)
+        out_type.append(t)
+        out_sub.append(s)
+        out_reason.append(msg)
+        out_flags.append(flags)
+
+    df["task_type"]   = out_type
+    df["task_subtype"]= out_sub
+    df["type_reason"] = out_reason
+    df["multi_flags"] = out_flags
+    # For convenience: one-hot view (optional)
+    df["is_general"]            = (df["task_type"] == "general")
+    df["is_deadline_hard"]      = (df["task_type"] == "deadline_hard")
+    df["is_latency_sensitive"]  = (df["task_type"] == "latency_sensitive")
+    df["is_compute_intensive"]  = (df["task_type"] == "compute_intensive")
+    df["is_data_intensive"]     = (df["task_type"] == "data_intensive")
+
+    return df
+
+
+def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+                                     verbose: bool = True) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    env_configs structure (as we fixed earlier):
+      env_configs[ep_name][topology_name][scenario_name]["tasks"] -> DataFrame
+
+    This function:
+      - applies Chapter-4 task typing to every tasks DF
+      - writes back the enriched DataFrame
+      - prints a short summary if verbose=True
+    """
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+                tasks = env_cfg["tasks"]
+                enriched = apply_ch4_task_typing(tasks)
+                env_cfg["tasks"] = enriched
+
+                if verbose:
+                    n = len(enriched)
+                    counts = enriched["task_type"].value_counts().to_dict()
+                    print(f"[typing] {ep_name}/{topo_name}/{scen_name}  n={n}  → {counts}")
+    return env_configs
+
+# ---- Run typing on your current env_configs (episode → topology → scenario) ----
+env_configs = apply_task_typing_in_env_configs(env_configs, verbose=True)
+
+# Example access:
+# env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags"]].head()
+
+
+
 
 
