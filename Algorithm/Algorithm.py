@@ -833,10 +833,6 @@ pairs_by_topology = assign_agents_to_mecs(pairs_by_topology)
 pairs_by_topology["clustered"]["ep_000"]["heavy"]["dataset"]["agents"].head()
 
 
-
-
-from typing import Dict, Any, Tuple
-
 def _extract_core_from_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     required = ["dataset", "topology_data", "connection_matrix_df", "Delta", "K"]
     for k in required:
@@ -976,3 +972,217 @@ env_configs = build_all_env_configs(pairs_by_topology)
 # Example access:
 # env_configs["clustered"]["ep_000"]["heavy"]["agent_to_mec"]
 # env_configs["full_mesh"]["ep_001"]["moderate"]["connection_matrix"]
+
+
+
+
+# 6. Environment Configuration
+
+# In this step, we build a unified env_config for each scenario–topology pair.
+# It bundles all required information for the MDP/RL environment—such as compute capacities,
+    # the Agent→MEC mapping, connection matrix, initial queue states, and action/state specifications—into
+    # a single consistent configuration used by the RL training process.
+    
+def _extract_core_from_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    required = ["dataset", "topology_data", "connection_matrix_df", "Delta", "K"]
+    for k in required:
+        if k not in bundle:
+            raise ValueError(f"Bundle missing required key: '{k}'")
+
+    ds   = bundle["dataset"]
+    topo = bundle["topology_data"]
+    Mdf  = bundle["connection_matrix_df"]
+
+    private_cpu = np.asarray(topo["private_cpu_capacities"], dtype=float)
+    public_cpu  = np.asarray(topo["public_cpu_capacities"],  dtype=float)
+    cloud_cpu   = float(topo["cloud_computational_capacity"])
+    M           = Mdf.to_numpy(dtype=float)  # (K, K+1), last col MEC→Cloud (MB/slot)
+
+    return dict(
+        Delta=float(bundle["Delta"]),
+        K=int(bundle["K"]),
+        episodes=ds["episodes"],
+        agents=ds["agents"],
+        arrivals=ds["arrivals"],
+        tasks=ds["tasks"],
+        private_cpu=private_cpu,
+        public_cpu=public_cpu,
+        cloud_cpu=cloud_cpu,
+        connection_matrix=M,
+        topology_type=topo.get("topology_type", "unknown"),
+    )
+
+def _build_default_queues(K: int) -> Dict[str, np.ndarray]:
+    return {
+        "mec_local_cycles":   np.zeros(K, dtype=float),
+        "mec_public_cycles":  np.zeros(K, dtype=float),
+        "mec_bytes_in_transit": np.zeros(K, dtype=float),
+        "cloud_cycles":       np.array([0.0], dtype=float),
+    }
+
+def _derive_action_space() -> Dict[str, Any]:
+    return {"type": "discrete", "n": 3, "labels": {0: "LOCAL", 1: "MEC", 2: "CLOUD"}}
+
+def _derive_state_spec(K: int) -> Dict[str, Any]:
+    return {
+        "components": {
+            "queues": {
+                "mec_local_cycles":  {"shape": (K,),   "dtype": "float"},
+                "mec_public_cycles": {"shape": (K,),   "dtype": "float"},
+                "cloud_cycles":      {"shape": (1,),   "dtype": "float"},
+            },
+            "links": {
+                "connection_matrix": {"shape": (K, K+1), "dtype": "float"},
+            },
+            "capacities": {
+                "private_cpu": {"shape": (K,), "dtype": "float"},
+                "public_cpu":  {"shape": (K,), "dtype": "float"},
+                "cloud_cpu":   {"shape": (1,), "dtype": "float"},
+            }
+        },
+        "note": "Declarative spec; tensor assembly happens in the Env at each step."
+    }
+
+def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    core = _extract_core_from_bundle(bundle)
+
+    if "agent_to_mec" not in bundle:
+        raise ValueError("Bundle has no 'agent_to_mec' mapping. Run Stage 5 first.")
+
+    agent_to_mec = bundle["agent_to_mec"]
+    if isinstance(agent_to_mec, pd.Series):
+        # reorder by agent_id if needed
+        if agent_to_mec.index.name != "agent_id":
+            agent_to_mec.index.name = "agent_id"
+        # enforce index = 0..N_agents-1
+        idx = core["agents"].sort_values("agent_id")["agent_id"].to_numpy()
+        agent_to_mec = agent_to_mec.reindex(idx)
+        agent_to_mec_arr = agent_to_mec.to_numpy(dtype=int)
+    else:
+        agent_to_mec_arr = np.asarray(agent_to_mec, dtype=int)
+
+    N_agents = int(core["episodes"]["N_agents"].iloc[0])
+    if len(agent_to_mec_arr) != N_agents:
+        raise ValueError(f"agent_to_mec length ({len(agent_to_mec_arr)}) != N_agents ({N_agents}).")
+
+    queues_init = _build_default_queues(core["K"])
+    action_space = _derive_action_space()
+    state_spec   = _derive_state_spec(core["K"])
+
+    env_config = {
+        "Delta": core["Delta"],
+        "K": core["K"],
+        "topology_type": core["topology_type"],
+        "connection_matrix": core["connection_matrix"],
+
+        "private_cpu": core["private_cpu"],
+        "public_cpu":  core["public_cpu"],
+        "cloud_cpu":   core["cloud_cpu"],
+
+        "N_agents": N_agents,
+        "agent_to_mec": agent_to_mec_arr,
+
+        # aligned dataframes (include f_local_slot, deadline_slots if شما قبلاً افزوده‌اید)
+        "episodes": core["episodes"],
+        "agents":   core["agents"],
+        "arrivals": core["arrivals"],
+        "tasks":    core["tasks"],
+
+        "queues_initial": queues_init,
+        "action_space": action_space,
+        "state_spec": state_spec,
+
+        "checks": bundle.get("checks", {"delta_match": True, "message": "n/a"}),
+    }
+    return env_config
+
+def build_all_env_configs(pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    """
+    Build env_config for every (topology / episode / scenario) bundle.
+
+    Output shape:
+        env_configs[topology][episode][scenario] = env_config
+    """
+    out: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    for topo_name, by_ep in pairs_by_topology.items():
+        out[topo_name] = {}
+        for ep_name, by_scen in by_ep.items():
+            out[topo_name][ep_name] = {}
+            for scen_name, bundle in by_scen.items():
+                if "agent_to_mec" not in bundle:
+                    raise RuntimeError(f"[{topo_name}/{ep_name}/{scen_name}] missing 'agent_to_mec'. Run Stage 5 first.")
+                env_cfg = build_env_config_for_bundle(bundle)
+                out[topo_name][ep_name][scen_name] = env_cfg
+    return out
+
+# Build
+env_configs = build_all_env_configs(pairs_by_topology)
+
+# Example access:
+env_configs["clustered"]["ep_000"]["heavy"]["agent_to_mec"]
+
+
+
+
+
+# 7. Sanity Checks
+
+# In this step, we verify that each env_config is internally consistent 
+    # (queue shapes, capacities, agent→MEC mapping, and connection matrix are valid and ready for simulation).
+    
+def sanity_check_env_config(env_config):
+    errors = []
+
+    # 1) Agent → MEC alignment
+    N_agents = env_config["N_agents"]
+    if len(env_config["agent_to_mec"]) != N_agents:
+        errors.append("Length of agent_to_mec does not match N_agents.")
+
+    # 2) Queue initial state shapes
+    K = env_config["K"]
+    q = env_config["queues_initial"]
+    if q["mec_local_cycles"].shape != (K,):
+        errors.append("mec_local_cycles queue shape mismatch.")
+    if q["mec_public_cycles"].shape != (K,):
+        errors.append("mec_public_cycles queue shape mismatch.")
+    if q["mec_bytes_in_transit"].shape != (K,):
+        errors.append("mec_bytes_in_transit queue shape mismatch.")
+    if q["cloud_cycles"].shape != (1,):
+        errors.append("cloud_cycles shape mismatch (should be (1,)).")
+
+    # 3) Non-negative compute capacities
+    if (env_config["private_cpu"] < 0).any():
+        errors.append("private_cpu has negative values.")
+    if (env_config["public_cpu"] < 0).any():
+        errors.append("public_cpu has negative values.")
+    if env_config["cloud_cpu"] < 0:
+        errors.append("cloud_cpu is negative.")
+
+    # 4) Connection matrix dimension (K x K+1)
+    M = env_config["connection_matrix"]
+    if M.shape != (K, K+1):
+        errors.append("connection_matrix shape mismatch.")
+
+    # 5) Action space correctness
+    if env_config["action_space"]["type"] != "discrete":
+        errors.append("Action space must be discrete (LOCAL/MEC/CLOUD).")
+
+    return errors
+
+def sanity_check_all(env_configs):
+    for topo_name, by_ep in env_configs.items():
+        for ep_name, by_scen in by_ep.items():
+            for scen_name, env_cfg in by_scen.items():
+                errs = sanity_check_env_config(env_cfg)
+                if errs:
+                    print(f"[FAIL] {topo_name}/{ep_name}/{scen_name}:")
+                    for e in errs:
+                        print("   -", e)
+                else:
+                    print(f"[OK]   {topo_name}/{ep_name}/{scen_name}")
+
+# Run all sanity checks
+sanity_check_all(env_configs)
+
+
