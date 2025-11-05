@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2025-10-28T10:47:04Z",
+  "generated_at_utc": "2025-11-05T07:48:31Z",
   "fingerprint": "3c16eced053eedde",
   "env": {
     "python": "3.10.9",
@@ -15,6 +15,33 @@
       "compute": "CPU cycles per second",
       "links": "MB per second"
     },
-    "conversion": "per_slot = per_second * time_step"
+    "conversion": "per_slot = per_second * time_step",
+    "topology_semantics": {
+      "skip_connections": "k-nearest ring; each MEC connects to next 'skip_k' neighbors on a circle"
+    }
+  },
+  "hyperparameters": {
+    "number_of_servers": 18,
+    "time_step": 1.0,
+    "private_cpu_min": 1200000000.0,
+    "private_cpu_max": 1800000000.0,
+    "public_cpu_min": 500000000.0,
+    "public_cpu_max": 900000000.0,
+    "cpu_total_min": null,
+    "cpu_total_max": null,
+    "public_share": null,
+    "cloud_capacity": 30000000000.0,
+    "cloud_capacity_min": null,
+    "cloud_capacity_max": null,
+    "horiz_cap_min": 8.0,
+    "horiz_cap_max": 12.0,
+    "cloud_cap_min": 80.0,
+    "cloud_cap_max": 120.0,
+    "topology_type": "skip_connections",
+    "skip_k": 1,
+    "symmetric": true,
+    "num_clusters": 3,
+    "inter_cluster_frac": 0.0,
+    "seed": 20251330
   }
 }

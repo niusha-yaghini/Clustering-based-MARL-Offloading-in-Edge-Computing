@@ -3,15 +3,23 @@
 HOODIE–style Topology Builder (enhanced, 3 variants)
 - Separate private/public capacities (not merged)
 - Connection matrix: shape (K, K+1), last column = MEC→Cloud
-- Styles: 'fully_connected' | 'skip_connections' | 'clustered'
+- Styles: 'fully_connected' | 'skip_connections' (k-nearest ring) | 'clustered'
 - Inputs per-second -> scaled by Delta to per-slot (HOODIE-compatible)
 
 Core outputs per topology: topology.json, topology_meta.json
 Extras per topology: connection_matrix.csv, topology_graph.png, topology_report.md
+
+Fixes/Improvements:
+- Enforce symmetry + zero diagonal (MEC↔MEC)
+- Add parameter asserts
+- Add hyperparameters dump to meta
+- Add link density to report
+- Optional weak inter-cluster links via inter_cluster_frac
+- Document skip_connections semantics in meta
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List, Tuple
 import numpy as np
 import json, os, time, hashlib, platform, getpass
@@ -23,7 +31,6 @@ try:
     _GRAPH_OK = True
 except Exception:
     _GRAPH_OK = False
-
 
 # =========================
 # Data classes
@@ -57,15 +64,15 @@ class TopologyHyper:
 
     # ----- Generator
     topology_type: str = "skip_connections"  # 'fully_connected' | 'skip_connections' | 'clustered'
-    skip_k: int = 5                           # for skip_connections
+    skip_k: int = 5                           # for skip_connections (k-nearest ring)
     symmetric: bool = True
 
     # For clustered
     num_clusters: int = 3
+    inter_cluster_frac: float = 0.0  # fraction of horiz_cap_min for weak inter-cluster links (0.0 => none)
 
     # ----- RNG
     seed: int = 2025
-
 
 # =========================
 # Utils
@@ -98,6 +105,21 @@ def _save_matrix_csv(M: np.ndarray, path: str) -> str:
         f.write("\n".join(lines))
     return path
 
+# =========================
+# Validations
+# =========================
+def _validate_h(h: TopologyHyper) -> None:
+    assert h.number_of_servers > 0 and h.time_step > 0
+    assert h.horiz_cap_max >= h.horiz_cap_min and h.cloud_cap_max >= h.cloud_cap_min
+    if h.private_cpu_min is not None:
+        assert h.private_cpu_max is not None and h.private_cpu_max >= h.private_cpu_min
+        assert h.public_cpu_min  is not None and h.public_cpu_max  is not None and h.public_cpu_max >= h.public_cpu_min
+    if h.cpu_total_min is not None:
+        assert h.cpu_total_max is not None and h.cpu_total_max >= h.cpu_total_min
+        share = h.public_share if h.public_share is not None else 0.3
+        assert 0.0 <= share <= 1.0
+    assert h.num_clusters >= 1
+    assert h.inter_cluster_frac >= 0.0
 
 # =========================
 # Builders: compute & cloud
@@ -127,7 +149,6 @@ def _build_compute_caps(h: TopologyHyper, rng: np.random.Generator) -> Tuple[Lis
     pub_slot  = (pub_sec  * h.time_step).astype(float).tolist()
     return priv_slot, pub_slot
 
-
 # =========================
 # Builders: connection matrix
 # =========================
@@ -152,6 +173,9 @@ def _build_connection_matrix_fully_connected(h: TopologyHyper, rng: np.random.Ge
     return M
 
 def _build_connection_matrix_skip_connections(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
+    """
+    k-nearest ring on a circular index: each node connects to next 'skip_k' neighbors.
+    """
     K = h.number_of_servers
     M = np.zeros((K, K + 1), dtype=float)
     _set_vertical_mec_to_cloud(M, h, rng)
@@ -171,21 +195,22 @@ def _build_connection_matrix_skip_connections(h: TopologyHyper, rng: np.random.G
 
 def _build_connection_matrix_clustered(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
     """
-    Clustered = چند خوشه با اتصال کامل درون‌خوشه‌ای (متقارن) و بدون/حداقل اتصال بین‌خوشه‌ای.
+    Clustered = several clusters with fully-connected intra-cluster links (symmetric),
+    and zero/weak inter-cluster connections controlled by inter_cluster_frac.
     """
     K = h.number_of_servers
     C = max(1, int(h.num_clusters))
     M = np.zeros((K, K + 1), dtype=float)
     _set_vertical_mec_to_cloud(M, h, rng)
 
-    # تقسیم K به C خوشه با اندازه‌های تقریباً برابر
+    # Divide K into C clusters with approximately equal sizes
     sizes = [K // C] * C
     for i in range(K % C):
         sizes[i] += 1
     starts = np.cumsum([0] + sizes[:-1])
     clusters = [(int(s), int(s + sz)) for s, sz in zip(starts, sizes)]  # [(start, end), ...]
 
-    # اتصال کامل و متقارن درون هر خوشه
+    # Fully connected and symmetric links within each cluster
     for (a, b) in clusters:
         for i in range(a, b):
             for j in range(i + 1, b):
@@ -194,17 +219,35 @@ def _build_connection_matrix_clustered(h: TopologyHyper, rng: np.random.Generato
                 M[i, j] = cap_slot
                 M[j, i] = cap_slot
 
-    # بین خوشه‌ها: صفر (می‌توان در صورت نیاز مقدار بسیار کم گذاشت)
+    # Weak inter-cluster links if requested
+    if h.inter_cluster_frac > 0.0:
+        weak = float(h.horiz_cap_min * h.inter_cluster_frac * h.time_step)
+        for c1 in range(len(clusters)):
+            for c2 in range(c1 + 1, len(clusters)):
+                a1, b1 = clusters[c1]
+                a2, b2 = clusters[c2]
+                i = a1   # representative node of cluster 1
+                j = a2   # representative node of cluster 2
+                if i != j:
+                    M[i, j] = max(M[i, j], weak)
+                    if h.symmetric:
+                        M[j, i] = max(M[j, i], weak)
+
     return M
 
 def _build_connection_matrix(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
     if h.topology_type == "fully_connected":
-        return _build_connection_matrix_fully_connected(h, rng)
+        M = _build_connection_matrix_fully_connected(h, rng)
     elif h.topology_type == "clustered":
-        return _build_connection_matrix_clustered(h, rng)
+        M = _build_connection_matrix_clustered(h, rng)
     else:
-        return _build_connection_matrix_skip_connections(h, rng)
+        M = _build_connection_matrix_skip_connections(h, rng)
 
+    K = h.number_of_servers
+    if h.symmetric:
+        M[:, :K] = np.maximum(M[:, :K], M[:, :K].T)
+    np.fill_diagonal(M[:, :K], 0.0)
+    return M
 
 # =========================
 # Graph drawing (optional)
@@ -217,6 +260,9 @@ def _draw_graph_png(M: np.ndarray,
         return None
 
     K = M.shape[0]
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
     G = nx.Graph()
 
     # MEC nodes
@@ -267,7 +313,6 @@ def _draw_graph_png(M: np.ndarray,
     plt.close()
     return out_png
 
-
 # =========================
 # Report (Markdown)
 # =========================
@@ -290,6 +335,8 @@ def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out
     M = np.array(topo["connection_matrix"], dtype=float)
     horiz = M[:, :K]
     vert  = M[:, K]
+    nonzero = int((horiz > 0).sum())
+    density = nonzero / float(K * (K - 1)) if K > 1 else 0.0
 
     md = []
     md.append(f"# Topology Report\n")
@@ -305,7 +352,7 @@ def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out
     md.append(f"- Cloud (single): {cloud:.3g}")
     md.append("")
     md.append(f"## Link Capacities ({link_unit})")
-    md.append(f"- Horizontal MEC↔MEC (non-zero entries): {int((horiz>0).sum())}")
+    md.append(f"- Horizontal MEC↔MEC (non-zero entries): {nonzero} (density={density:.3f})")
     md.append(f"- MEC→Cloud (length K): min={vert.min():.3g}, mean={vert.mean():.3g}, max={vert.max():.3g}")
     md.append("")
     if graph_png:
@@ -319,13 +366,13 @@ def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out
     _save_text(md_txt, out_md)
     return out_md
 
-
 # =========================
 # Main builder
 # =========================
 def build_topology(h: TopologyHyper,
                    out_topology: str = "./topology/topology.json",
                    out_meta: str = "./topology/topology_meta.json") -> Dict[str, str]:
+    _validate_h(h)
     rng = np.random.default_rng(h.seed)
 
     private_caps, public_caps = _build_compute_caps(h, rng)
@@ -351,8 +398,14 @@ def build_topology(h: TopologyHyper,
         "fingerprint": _fp(topo),
         "env": {"python": platform.python_version(), "user": getpass.getuser()},
         "units": {"compute": "CPU cycles per slot", "links": "MB per slot", "time_step": "seconds"},
-        "notes": {"inputs_unit": {"compute": "CPU cycles per second", "links": "MB per second"},
-                  "conversion": "per_slot = per_second * time_step"}
+        "notes": {
+            "inputs_unit": {"compute": "CPU cycles per second", "links": "MB per second"},
+            "conversion": "per_slot = per_second * time_step",
+            "topology_semantics": {
+                "skip_connections": "k-nearest ring; each MEC connects to next 'skip_k' neighbors on a circle"
+            }
+        },
+        "hyperparameters": asdict(h)
     }
 
     _save_json(topo, out_topology)
@@ -377,7 +430,6 @@ def build_topology(h: TopologyHyper,
         "graph_png": graph_png if graph_png else "",
         "report_md": report_md
     }
-
 
 # =========================
 # Build from JSON hyperparams (optional)
@@ -408,6 +460,7 @@ def build_from_hyperparameters_json(hparams_path: str,
         skip_k            = int(hp.get("skip_k", 5)),
         symmetric         = bool(hp.get("symmetric", True)),
         num_clusters      = int(hp.get("num_clusters", 3)),
+        inter_cluster_frac= float(hp.get("inter_cluster_frac", 0.0)),
         seed              = int(hp.get("seed", 2025))
     )
 
@@ -417,7 +470,6 @@ def build_from_hyperparameters_json(hparams_path: str,
         out_topology=os.path.join(out_dir, "topology.json"),
         out_meta=os.path.join(out_dir, "topology_meta.json")
     )
-
 
 # =========================
 # Build 3 fixed, reproducible topologies (variants)
@@ -446,6 +498,7 @@ def build_three_topologies_variants(
     cloud_cap_max: float = 120.0,
     # Cluster params
     num_clusters: int = 3,
+    inter_cluster_frac: float = 0.0,
 ):
     os.makedirs(out_root, exist_ok=True)
 
@@ -462,7 +515,7 @@ def build_three_topologies_variants(
                 horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
                 cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
                 topology_type="fully_connected", skip_k=1, symmetric=True,
-                num_clusters=num_clusters,
+                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
                 seed=seed_base + 101
             )
         ),
@@ -478,7 +531,7 @@ def build_three_topologies_variants(
                 horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
                 cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
                 topology_type="clustered", symmetric=True,
-                num_clusters=num_clusters,
+                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
                 seed=seed_base + 202
             )
         ),
@@ -494,7 +547,7 @@ def build_three_topologies_variants(
                 horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
                 cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
                 topology_type="skip_connections", skip_k=1, symmetric=True,  # ring
-                num_clusters=num_clusters,
+                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
                 seed=seed_base + 303
             )
         ),
@@ -515,7 +568,6 @@ def build_three_topologies_variants(
 
     return results
 
-
 # =========================
 # Example multi-build run
 # =========================
@@ -531,7 +583,7 @@ if __name__ == "__main__":
         cloud_capacity=3.0e10,
         horiz_cap_min=8.0, horiz_cap_max=12.0,
         cloud_cap_min=80.0, cloud_cap_max=120.0,
-        num_clusters=3,
+        num_clusters=3, inter_cluster_frac=0.0,
         out_root="./topologies"
     )
     print(json.dumps(out, indent=2))

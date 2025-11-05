@@ -10,7 +10,7 @@
 - Cloud (single): 3e+10
 
 ## Link Capacities (MB per slot)
-- Horizontal MEC↔MEC (non-zero entries): 36
+- Horizontal MEC↔MEC (non-zero entries): 36 (density=0.118)
 - MEC→Cloud (length K): min=82, mean=101, max=120
 
 ## Graph
