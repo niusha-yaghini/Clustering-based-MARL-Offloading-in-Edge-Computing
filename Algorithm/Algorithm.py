@@ -1524,9 +1524,209 @@ def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, 
 env_configs = apply_task_typing_in_env_configs(env_configs, verbose=True)
 
 # Example access:
-# env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags"]].head()
+env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags"]].head()
 
 
+
+
+
+# Step 3: Agent Profiling
+
+# ---- Helper 1: per-agent per-slot counts (arrivals) ----
+def _per_agent_slot_counts(arrivals_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a (agent_id, t_slot) -> count table of arrivals per slot.
+    Missing (agent, slot) combos are not filled here; we aggregate on observed rows.
+    """
+    if not {"agent_id", "t_slot"}.issubset(arrivals_df.columns):
+        raise ValueError("arrivals must contain 'agent_id' and 't_slot'.")
+    grp = arrivals_df.groupby(["agent_id", "t_slot"], as_index=False).size()
+    grp.rename(columns={"size": "count"}, inplace=True)
+    return grp  # columns: agent_id, t_slot, count
+
+
+# ---- Helper 2: lambda stats per agent ----
+def _lambda_stats_from_counts(counts_df: pd.DataFrame, Delta: float) -> pd.DataFrame:
+    """
+    Estimate mean and variance of arrival RATE (per-second) for each agent:
+      lambda_mean = mean(count_per_slot) / Delta
+      lambda_var  = var(count_per_slot)  / Delta^2
+    Returns columns: agent_id, lambda_mean, lambda_var, slots_observed
+    """
+    if counts_df.empty:
+        return pd.DataFrame(columns=["agent_id", "lambda_mean", "lambda_var", "slots_observed"])
+    agg = counts_df.groupby("agent_id")["count"].agg(
+        lambda_mean_slot="mean",
+        lambda_var_slot="var",
+        slots_observed="count"
+    ).reset_index()
+    # Handle NaN var for single observation (set to 0.0)
+    agg["lambda_var_slot"] = agg["lambda_var_slot"].fillna(0.0)
+
+    agg["lambda_mean"] = agg["lambda_mean_slot"] / float(Delta)
+    agg["lambda_var"]  = agg["lambda_var_slot"]  / float(Delta**2)
+    return agg[["agent_id", "lambda_mean", "lambda_var", "slots_observed"]]
+
+
+# ---- Helper 3: task-type distribution per agent ----
+_TASK_TYPES = ["general", "latency_sensitive", "deadline_hard", "data_intensive", "compute_intensive"]
+
+def _task_distribution_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build per-agent TaskDist over final task types (from Step 2.2).
+    Returns one row per agent with columns:
+      P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive, n_tasks_agent
+    If an agent has zero tasks, probabilities are set to 0 (and n_tasks_agent = 0).
+    """
+    if "task_type" not in tasks_df.columns or "agent_id" not in tasks_df.columns:
+        raise ValueError("tasks must contain 'agent_id' and 'task_type' (from Step 2.2).")
+
+    # Count tasks per (agent_id, task_type)
+    cnt = tasks_df.groupby(["agent_id", "task_type"], as_index=False).size()
+    # Pivot to columns per task_type
+    piv = cnt.pivot(index="agent_id", columns="task_type", values="size").fillna(0.0)
+
+    # Ensure all task type columns exist
+    for t in _TASK_TYPES:
+        if t not in piv.columns:
+            piv[t] = 0.0
+
+    piv["n_tasks_agent"] = piv[_TASK_TYPES].sum(axis=1)
+    # Probabilities (sum to 1 if n_tasks_agent>0; otherwise 0)
+    for t in _TASK_TYPES:
+        piv[f"P_{t}"] = np.where(
+            piv["n_tasks_agent"] > 0,
+            piv[t] / piv["n_tasks_agent"],
+            0.0
+        )
+
+    # Keep only probability columns + count
+    keep_cols = ["n_tasks_agent"] + [f"P_{t}" for t in _TASK_TYPES]
+    out = piv[keep_cols].reset_index()  # keep agent_id
+    return out
+
+
+# ---- Helper 4: non-atomic share per agent ----
+def _non_atomic_share_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute share of non-atomic tasks per agent.
+    Returns: agent_id, non_atomic_share
+    """
+    if not {"agent_id", "non_atomic"}.issubset(tasks_df.columns):
+        # If non_atomic missing, default to 0.0
+        agents = tasks_df.get("agent_id")
+        if agents is None or len(agents) == 0:
+            return pd.DataFrame(columns=["agent_id", "non_atomic_share"])
+        return (
+            pd.DataFrame({"agent_id": agents.unique()})
+              .assign(non_atomic_share=0.0)
+        )
+
+    grp = tasks_df.groupby("agent_id")["non_atomic"].agg(
+        non_atomic_share=lambda s: float((s == 1).mean()) if len(s) else 0.0
+    ).reset_index()
+    return grp
+
+
+# ---- Main: build agent profiles for ONE env_config ----
+def build_agent_profiles_for_env(env_cfg: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Construct per-agent profiles using (episodes, agents, arrivals, tasks) in env_cfg.
+    Output columns include:
+      agent_id, mec_id, f_local, f_local_slot, m_local,
+      lambda_mean, lambda_var, slots_observed,
+      n_tasks_agent, P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive,
+      non_atomic_share
+    """
+    episodes = env_cfg["episodes"]
+    agents   = env_cfg["agents"].copy()
+    arrivals = env_cfg["arrivals"]
+    tasks    = env_cfg["tasks"]
+    Delta    = float(env_cfg["Delta"])
+
+    # Ensure f_local_slot exists (should be added in Units Alignment; compute if missing)
+    if "f_local_slot" not in agents.columns and "f_local" in agents.columns:
+        agents["f_local_slot"] = agents["f_local"].astype(float) * Delta
+
+    # 1) λ stats from arrivals
+    counts_df = _per_agent_slot_counts(arrivals)
+    lam_df    = _lambda_stats_from_counts(counts_df, Delta=Delta)
+
+    # 2) Task distributions per agent
+    dist_df   = _task_distribution_per_agent(tasks)
+
+    # 3) Non-atomic share per agent
+    na_df     = _non_atomic_share_per_agent(tasks)
+
+    # 4) MEC mapping (optional; from env_cfg["agent_to_mec"])
+    mec_map = None
+    if "agent_to_mec" in env_cfg:
+        a2m = env_cfg["agent_to_mec"]
+        if isinstance(a2m, pd.Series):
+            mec_map = a2m.rename("mec_id").reset_index()
+        else:
+            # assume in order of agent_id (0..N-1)
+            mec_map = pd.DataFrame({"agent_id": np.arange(len(a2m), dtype=int),
+                                    "mec_id": np.asarray(a2m, dtype=int)})
+
+    # 5) Base identity table for all agents
+    base = agents[["agent_id", "f_local", "f_local_slot", "m_local"]].copy()
+
+    # 6) Merge everything
+    prof = base.merge(lam_df, on="agent_id", how="left") \
+               .merge(dist_df, on="agent_id", how="left") \
+               .merge(na_df, on="agent_id", how="left")
+
+    if mec_map is not None:
+        prof = prof.merge(mec_map, on="agent_id", how="left")
+
+    # Fill NaNs for agents with no arrivals/tasks
+    fill_zero_cols = [
+        "lambda_mean", "lambda_var", "slots_observed",
+        "n_tasks_agent", "non_atomic_share"
+    ] + [f"P_{t}" for t in _TASK_TYPES]
+    for c in fill_zero_cols:
+        if c in prof.columns:
+            prof[c] = prof[c].fillna(0.0)
+
+    # Final ordering
+    ordered_cols = [
+        "agent_id", "mec_id",
+        "f_local", "f_local_slot", "m_local",
+        "lambda_mean", "lambda_var", "slots_observed",
+        "n_tasks_agent",
+        "P_general", "P_latency_sensitive", "P_deadline_hard", "P_data_intensive", "P_compute_intensive",
+        "non_atomic_share",
+    ]
+    # Keep existing columns in the desired order
+    ordered_cols = [c for c in ordered_cols if c in prof.columns] + \
+                   [c for c in prof.columns if c not in ordered_cols]
+    prof = prof[ordered_cols]
+
+    # Sanity: probabilities should sum to 1 for agents with tasks
+    prob_cols = [f"P_{t}" for t in _TASK_TYPES if f"P_{t}" in prof.columns]
+    if prob_cols:
+        prof["TaskDist_sum"] = prof[prob_cols].sum(axis=1)
+    return prof
+
+
+# ---- Batch: build profiles for ALL env_configs (episode → topology → scenario) ----
+def build_all_agent_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Dict[str, pd.DataFrame]]]:
+    """
+    Returns:
+      agent_profiles[ep_name][topology_name][scenario_name] = DataFrame (per-agent profiles)
+    """
+    out: Dict[str, Dict[str, Dict[str, pd.DataFrame]]] = {}
+    for ep_name, by_topo in env_configs.items():
+        out[ep_name] = {}
+        for topo_name, by_scen in by_topo.items():
+            out[ep_name][topo_name] = {}
+            for scen_name, env_cfg in by_scen.items():
+                prof_df = build_agent_profiles_for_env(env_cfg)
+                out[ep_name][topo_name][scen_name] = prof_df
+                # (Optional) Attach back to env_cfg for convenience
+                env_cfg["agent_profiles"] = prof_df
+    return out
 
 
 
