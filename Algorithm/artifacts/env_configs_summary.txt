@@ -1,0 +1,522 @@
+=== ENV CONFIGS SUMMARY (episode → topology → scenario) ===
+
+[EPISODE] ep_000
+  [TOPOLOGY] clustered
+    [SCENARIO] heavy
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'clustered'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.2, mean=7.878
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.22e+09, max=1.786e+09, mean=1.502e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.02e+08, max=8.225e+08, mean=7.072e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(30636, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(30636, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] light
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'clustered'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.2, mean=7.878
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.22e+09, max=1.786e+09, mean=1.502e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.02e+08, max=8.225e+08, mean=7.072e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(2113, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(2113, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] moderate
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'clustered'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.2, mean=7.878
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.22e+09, max=1.786e+09, mean=1.502e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.02e+08, max=8.225e+08, mean=7.072e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(8262, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(8262, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+
+  [TOPOLOGY] full_mesh
+    [SCENARIO] heavy
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'fully_connected'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=116.7, mean=14.28
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.231e+09, max=1.785e+09, mean=1.487e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.187e+08, max=8.656e+08, mean=7.166e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(30636, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(30636, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] light
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'fully_connected'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=116.7, mean=14.28
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.231e+09, max=1.785e+09, mean=1.487e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.187e+08, max=8.656e+08, mean=7.166e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(2113, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(2113, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] moderate
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'fully_connected'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=116.7, mean=14.28
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.231e+09, max=1.785e+09, mean=1.487e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.187e+08, max=8.656e+08, mean=7.166e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(8262, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(8262, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+
+  [TOPOLOGY] sparse_ring
+    [SCENARIO] heavy
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'skip_connections'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.6, mean=6.35
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.211e+09, max=1.763e+09, mean=1.408e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.846e+08, max=8.956e+08, mean=7.437e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(30636, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(30636, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] light
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'skip_connections'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.6, mean=6.35
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.211e+09, max=1.763e+09, mean=1.408e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.846e+08, max=8.956e+08, mean=7.437e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(2113, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(2113, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+    [SCENARIO] moderate
+      Delta: 1.0
+      K: 18
+      N_agents: 18
+      topology_type: 'skip_connections'
+      connection_matrix: ndarray shape=(18, 19), dtype=float64 | min=0, max=119.6, mean=6.35
+      private_cpu: ndarray shape=(18,), dtype=float64 | min=1.211e+09, max=1.763e+09, mean=1.408e+09
+      public_cpu: ndarray shape=(18,), dtype=float64 | min=5.846e+08, max=8.956e+08, mean=7.437e+08
+      cloud_cpu: 30000000000.0
+      agent_to_mec: ndarray shape=(18,), dtype=int32 | min=0, max=17, mean=8.5
+      episodes: DataFrame shape=(1, 7), columns=['scenario', 'episode_id', 'Delta', 'T_slots', 'hours', 'N_agents', 'seed']
+      agents: DataFrame shape=(18, 5), columns=['agent_id', 'f_local', 'm_local', 'lam_sec', 'mec_id']
+      arrivals: DataFrame shape=(8262, 6), columns=['scenario', 'episode_id', 't_slot', 't_time', 'agent_id', 'task_id']
+      tasks: DataFrame shape=(8262, 17), columns=['scenario', 'episode_id', 'task_id', 'agent_id', 't_arrival_slot', 't_arrival_time', 'b_mb', 'rho_cyc_per_mb', 'c_cycles', 'mem_mb', '...']
+      queues_initial: dict keys=['mec_local_cycles', 'mec_public_cycles', 'mec_bytes_in_transit', 'cloud_cycles']
+        mec_local_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_public_cycles: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        mec_bytes_in_transit: ndarray shape=(18,), dtype=float64 | min=0, max=0, mean=0
+        cloud_cycles: ndarray shape=(1,), dtype=float64 | values=[0.0]
+      action_space: dict keys=['type', 'n', 'labels']
+        type: 'discrete'
+        n: 3
+        labels: dict keys=[0, 1, 2]
+          0: 'LOCAL'
+          1: 'MEC'
+          2: 'CLOUD'
+      state_spec: dict keys=['components', 'note']
+        components: dict keys=['queues', 'links', 'capacities']
+          queues: dict keys=['mec_local_cycles', 'mec_public_cycles', 'cloud_cycles']
+            mec_local_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            mec_public_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cycles: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+          links: dict keys=['connection_matrix']
+            connection_matrix: dict keys=['shape', 'dtype']
+              shape: list len=2, preview=(18, 19)
+              dtype: 'float'
+          capacities: dict keys=['private_cpu', 'public_cpu', 'cloud_cpu']
+            private_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            public_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(18,)
+              dtype: 'float'
+            cloud_cpu: dict keys=['shape', 'dtype']
+              shape: list len=1, preview=(1,)
+              dtype: 'float'
+        note: 'Declarative spec; tensor assembly happens in the Env at each step.'
+      checks: dict keys=['delta_match', 'message']
+        delta_match: True
+        message: 'OK'
+
+

@@ -1530,203 +1530,216 @@ env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","tas
 
 
 
-# Step 3: Agent Profiling
+# Step 3 — Agent Profiling (full cell, revised)
 
-# ---- Helper 1: per-agent per-slot counts (arrivals) ----
+# ---- Helper 1: per-agent per-slot arrival counts ----
 def _per_agent_slot_counts(arrivals_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a (agent_id, t_slot) -> count table of arrivals per slot.
-    Missing (agent, slot) combos are not filled here; we aggregate on observed rows.
+    Count how many tasks each agent generates in each time slot.
+    This is used to estimate lambda (arrival rate) statistics.
     """
     if not {"agent_id", "t_slot"}.issubset(arrivals_df.columns):
         raise ValueError("arrivals must contain 'agent_id' and 't_slot'.")
     grp = arrivals_df.groupby(["agent_id", "t_slot"], as_index=False).size()
     grp.rename(columns={"size": "count"}, inplace=True)
-    return grp  # columns: agent_id, t_slot, count
+    return grp
 
-
-# ---- Helper 2: lambda stats per agent ----
+# ---- Helper 2: estimate λ-mean and λ-variance per agent (tight dtypes) ----
 def _lambda_stats_from_counts(counts_df: pd.DataFrame, Delta: float) -> pd.DataFrame:
     """
-    Estimate mean and variance of arrival RATE (per-second) for each agent:
-      lambda_mean = mean(count_per_slot) / Delta
-      lambda_var  = var(count_per_slot)  / Delta^2
-    Returns columns: agent_id, lambda_mean, lambda_var, slots_observed
+    Convert per-slot counts to rate statistics:
+        lambda_mean = mean(count_per_slot) / Delta
+        lambda_var  = var(count_per_slot)  / Delta^2
     """
     if counts_df.empty:
         return pd.DataFrame(columns=["agent_id", "lambda_mean", "lambda_var", "slots_observed"])
+
     agg = counts_df.groupby("agent_id")["count"].agg(
         lambda_mean_slot="mean",
         lambda_var_slot="var",
         slots_observed="count"
     ).reset_index()
-    # Handle NaN var for single observation (set to 0.0)
-    agg["lambda_var_slot"] = agg["lambda_var_slot"].fillna(0.0)
 
-    agg["lambda_mean"] = agg["lambda_mean_slot"] / float(Delta)
-    agg["lambda_var"]  = agg["lambda_var_slot"]  / float(Delta**2)
+    # If only one observation exists, variance becomes NaN → treat as zero.
+    agg["lambda_var_slot"] = agg["lambda_var_slot"].fillna(0.0).astype(float)
+
+    # Convert to per-second rates
+    agg["lambda_mean"] = (agg["lambda_mean_slot"] / float(Delta)).astype(float)
+    agg["lambda_var"]  = (agg["lambda_var_slot"]  / float(Delta**2)).astype(float)
+
     return agg[["agent_id", "lambda_mean", "lambda_var", "slots_observed"]]
 
-
-# ---- Helper 3: task-type distribution per agent ----
+# ---- Helper 3: task-type distribution per agent (robust + extra stats) ----
 _TASK_TYPES = ["general", "latency_sensitive", "deadline_hard", "data_intensive", "compute_intensive"]
 
 def _task_distribution_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build per-agent TaskDist over final task types (from Step 2.2).
-    Returns one row per agent with columns:
-      P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive, n_tasks_agent
-    If an agent has zero tasks, probabilities are set to 0 (and n_tasks_agent = 0).
+    Compute distribution of task types per agent (probabilities sum to 1 for agents with tasks).
+    Also adds light median features useful for clustering: b_mb_med, rho_med, mem_med, hard_share.
     """
-    if "task_type" not in tasks_df.columns or "agent_id" not in tasks_df.columns:
-        raise ValueError("tasks must contain 'agent_id' and 'task_type' (from Step 2.2).")
+    if not {"agent_id", "task_type"}.issubset(tasks_df.columns):
+        raise ValueError("tasks must contain 'agent_id' and 'task_type'.")
 
-    # Count tasks per (agent_id, task_type)
+    # Raw counts per (agent_id, task_type)
     cnt = tasks_df.groupby(["agent_id", "task_type"], as_index=False).size()
-    # Pivot to columns per task_type
     piv = cnt.pivot(index="agent_id", columns="task_type", values="size").fillna(0.0)
 
-    # Ensure all task type columns exist
+    # Ensure all expected classes exist
     for t in _TASK_TYPES:
         if t not in piv.columns:
             piv[t] = 0.0
 
-    piv["n_tasks_agent"] = piv[_TASK_TYPES].sum(axis=1)
-    # Probabilities (sum to 1 if n_tasks_agent>0; otherwise 0)
+    # True count across all seen labels
+    piv["n_tasks_agent"] = piv[_TASK_TYPES].sum(axis=1).astype(float)
+
+    # Probabilities
     for t in _TASK_TYPES:
-        piv[f"P_{t}"] = np.where(
-            piv["n_tasks_agent"] > 0,
-            piv[t] / piv["n_tasks_agent"],
-            0.0
-        )
+        piv[f"P_{t}"] = np.where(piv["n_tasks_agent"] > 0, piv[t] / piv["n_tasks_agent"], 0.0).astype(float)
 
-    # Keep only probability columns + count
-    keep_cols = ["n_tasks_agent"] + [f"P_{t}" for t in _TASK_TYPES]
-    out = piv[keep_cols].reset_index()  # keep agent_id
-    return out
+    # Optional extra features for clustering (guard on availability)
+    feats = {}
+    have_feats = {"b_mb", "rho_cyc_per_mb", "mem_mb", "urgency"}
+    if have_feats.issubset(tasks_df.columns):
+        agg = tasks_df.groupby("agent_id").agg(
+            b_mb_med=("b_mb", "median"),
+            rho_med=("rho_cyc_per_mb", "median"),
+            mem_med=("mem_mb", "median"),
+            hard_share=("urgency", lambda s: float((s == "hard").mean()))
+        ).reset_index()
+        feats = agg.set_index("agent_id")
 
+    # Join extra features (if any)
+    piv = piv.join(feats, how="left")
+    for c in ["b_mb_med", "rho_med", "mem_med", "hard_share"]:
+        if c in piv.columns:
+            piv[c] = piv[c].fillna(0.0).astype(float)
+        else:
+            piv[c] = 0.0
 
-# ---- Helper 4: non-atomic share per agent ----
+    # Probability mass sum (diagnostic)
+    prob_cols = [f"P_{t}" for t in _TASK_TYPES]
+    piv["TaskDist_sum"] = piv[prob_cols].sum(axis=1).astype(float)
+
+    keep = ["n_tasks_agent", "TaskDist_sum", "b_mb_med", "rho_med", "mem_med", "hard_share"] + prob_cols
+    return piv[keep].reset_index()
+
+# ---- Helper 4: fraction of non-atomic (splittable) tasks ----
 def _non_atomic_share_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute share of non-atomic tasks per agent.
-    Returns: agent_id, non_atomic_share
+    Compute the share of splittable (non-atomic) tasks per agent.
     """
     if not {"agent_id", "non_atomic"}.issubset(tasks_df.columns):
-        # If non_atomic missing, default to 0.0
+        # If missing, assume zero for all agents that exist in tasks
         agents = tasks_df.get("agent_id")
         if agents is None or len(agents) == 0:
             return pd.DataFrame(columns=["agent_id", "non_atomic_share"])
-        return (
-            pd.DataFrame({"agent_id": agents.unique()})
-              .assign(non_atomic_share=0.0)
-        )
+        return pd.DataFrame({"agent_id": agents.unique(), "non_atomic_share": 0.0})
 
     grp = tasks_df.groupby("agent_id")["non_atomic"].agg(
-        non_atomic_share=lambda s: float((s == 1).mean()) if len(s) else 0.0
+        non_atomic_share=lambda s: float((s == 1).mean())
     ).reset_index()
     return grp
 
-
-# ---- Main: build agent profiles for ONE env_config ----
+# ---- Build agent profiles for ONE env_config ----
 def build_agent_profiles_for_env(env_cfg: Dict[str, Any]) -> pd.DataFrame:
     """
-    Construct per-agent profiles using (episodes, agents, arrivals, tasks) in env_cfg.
-    Output columns include:
-      agent_id, mec_id, f_local, f_local_slot, m_local,
-      lambda_mean, lambda_var, slots_observed,
-      n_tasks_agent, P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive,
-      non_atomic_share
+    Construct per-agent profiles combining:
+      - Local resource capacity (f_local, m_local, f_local_slot)
+      - Arrival rate statistics (lambda_mean, lambda_var)
+      - Task type distribution (P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive)
+      - Splittability share (non_atomic_share)
+      - MEC mapping if available (mec_id)
     """
-    episodes = env_cfg["episodes"]
     agents   = env_cfg["agents"].copy()
     arrivals = env_cfg["arrivals"]
     tasks    = env_cfg["tasks"]
     Delta    = float(env_cfg["Delta"])
 
-    # Ensure f_local_slot exists (should be added in Units Alignment; compute if missing)
+    # Ensure cycles/slot exists
     if "f_local_slot" not in agents.columns and "f_local" in agents.columns:
         agents["f_local_slot"] = agents["f_local"].astype(float) * Delta
 
-    # 1) λ stats from arrivals
+    # 1) Arrival statistics
     counts_df = _per_agent_slot_counts(arrivals)
     lam_df    = _lambda_stats_from_counts(counts_df, Delta=Delta)
 
-    # 2) Task distributions per agent
+    # 2) Task-type distribution (+ medians & hard_share)
     dist_df   = _task_distribution_per_agent(tasks)
 
-    # 3) Non-atomic share per agent
+    # 3) Splittable-task share
     na_df     = _non_atomic_share_per_agent(tasks)
 
-    # 4) MEC mapping (optional; from env_cfg["agent_to_mec"])
+    # 4) Agent→MEC mapping (optional)
     mec_map = None
     if "agent_to_mec" in env_cfg:
         a2m = env_cfg["agent_to_mec"]
         if isinstance(a2m, pd.Series):
             mec_map = a2m.rename("mec_id").reset_index()
+            # if the index column name is lost, normalize it
+            if mec_map.columns.tolist() == ["index", "mec_id"]:
+                mec_map.rename(columns={"index": "agent_id"}, inplace=True)
         else:
-            # assume in order of agent_id (0..N-1)
-            mec_map = pd.DataFrame({"agent_id": np.arange(len(a2m), dtype=int),
-                                    "mec_id": np.asarray(a2m, dtype=int)})
+            mec_map = pd.DataFrame({
+                "agent_id": np.arange(len(a2m), dtype=int),
+                "mec_id": np.asarray(a2m, dtype=int)
+            })
 
-    # 5) Base identity table for all agents
+    # Merge all components
     base = agents[["agent_id", "f_local", "f_local_slot", "m_local"]].copy()
+    base[["f_local", "f_local_slot", "m_local"]] = base[["f_local", "f_local_slot", "m_local"]].astype(float)
 
-    # 6) Merge everything
-    prof = base.merge(lam_df, on="agent_id", how="left") \
-               .merge(dist_df, on="agent_id", how="left") \
-               .merge(na_df, on="agent_id", how="left")
+    prof = (base
+            .merge(lam_df,  on="agent_id", how="left")
+            .merge(dist_df, on="agent_id", how="left")
+            .merge(na_df,   on="agent_id", how="left"))
 
     if mec_map is not None:
         prof = prof.merge(mec_map, on="agent_id", how="left")
 
-    # Fill NaNs for agents with no arrivals/tasks
-    fill_zero_cols = [
+    # Fill missing for agents with no arrivals/tasks
+    fill_zero = [
         "lambda_mean", "lambda_var", "slots_observed",
-        "n_tasks_agent", "non_atomic_share"
+        "n_tasks_agent", "non_atomic_share",
+        "TaskDist_sum", "b_mb_med", "rho_med", "mem_med", "hard_share"
     ] + [f"P_{t}" for t in _TASK_TYPES]
-    for c in fill_zero_cols:
+    for c in fill_zero:
         if c in prof.columns:
-            prof[c] = prof[c].fillna(0.0)
+            prof[c] = prof[c].fillna(0.0).astype(float)
 
-    # Final ordering
-    ordered_cols = [
-        "agent_id", "mec_id",
-        "f_local", "f_local_slot", "m_local",
-        "lambda_mean", "lambda_var", "slots_observed",
-        "n_tasks_agent",
-        "P_general", "P_latency_sensitive", "P_deadline_hard", "P_data_intensive", "P_compute_intensive",
-        "non_atomic_share",
-    ]
-    # Keep existing columns in the desired order
-    ordered_cols = [c for c in ordered_cols if c in prof.columns] + \
-                   [c for c in prof.columns if c not in ordered_cols]
-    prof = prof[ordered_cols]
+    # Soft warning if probabilities don't sum to ~1 for agents with tasks
+    if "n_tasks_agent" in prof.columns and "TaskDist_sum" in prof.columns:
+        mask = (prof["n_tasks_agent"] > 0) & (~np.isclose(prof["TaskDist_sum"], 1.0, atol=1e-6))
+        if mask.any():
+            n_bad = int(mask.sum())
+            print(f"[warn] TaskDist_sum != 1.0 for {n_bad} agent(s). (tolerance 1e-6)")
 
-    # Sanity: probabilities should sum to 1 for agents with tasks
-    prob_cols = [f"P_{t}" for t in _TASK_TYPES if f"P_{t}" in prof.columns]
-    if prob_cols:
-        prof["TaskDist_sum"] = prof[prob_cols].sum(axis=1)
     return prof
 
-
-# ---- Batch: build profiles for ALL env_configs (episode → topology → scenario) ----
-def build_all_agent_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Dict[str, pd.DataFrame]]]:
+# ---- Batch profiling for ALL env_configs ----
+def build_all_agent_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
     """
-    Returns:
-      agent_profiles[ep_name][topology_name][scenario_name] = DataFrame (per-agent profiles)
+    Compute profiles for every (episode → topology → scenario) environment.
+    Stores result both in return dict AND env_configs[...] for convenience.
+    Output:
+      profiles[ep_name][topology_name][scen_name] = DataFrame
+    Also writes back to: env_configs[ep_name][topology_name][scen_name]["agent_profiles"]
     """
-    out: Dict[str, Dict[str, Dict[str, pd.DataFrame]]] = {}
+    out = {}
     for ep_name, by_topo in env_configs.items():
         out[ep_name] = {}
         for topo_name, by_scen in by_topo.items():
             out[ep_name][topo_name] = {}
             for scen_name, env_cfg in by_scen.items():
-                prof_df = build_agent_profiles_for_env(env_cfg)
-                out[ep_name][topo_name][scen_name] = prof_df
-                # (Optional) Attach back to env_cfg for convenience
-                env_cfg["agent_profiles"] = prof_df
+                prof = build_agent_profiles_for_env(env_cfg)
+                out[ep_name][topo_name][scen_name] = prof
+                env_cfg["agent_profiles"] = prof  # attach for direct access
     return out
 
+# ---- Build + quick peek (optional) ----
+agent_profiles = build_all_agent_profiles(env_configs)
 
+# Example: Access the profile table for a specific episode / topology / scenario
+print(agent_profiles["ep_000"]["clustered"]["heavy"].head())
 
+# Alternatively, read directly from env_configs:
+# display(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head())
