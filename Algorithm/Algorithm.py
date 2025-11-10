@@ -1,10 +1,13 @@
-# Imports
 import pandas as pd
 import numpy as np
 import json
 import os
 import math
+import matplotlib.pyplot as plt
 from typing import Dict, Any, Tuple
+
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.cluster import KMeans
 
 
 # Step 1: Prepare data and configure the environment
@@ -14,6 +17,8 @@ from typing import Dict, Any, Tuple
 # Define the base directories
 dataset_dir = '../Data_Generator/datasets'
 topology_dir = '../Topology_Generator/topologies'
+
+# Loading dataset
 
 # Global container
 datasets = {}
@@ -89,8 +94,8 @@ def load_datasets_from_directory(dataset_dir, verbose=True):
 
     return datasets
 
+
 # ---- load all datasets (episode-first) ----
-dataset_dir = '../Data_Generator/datasets'
 datasets = load_datasets_from_directory(dataset_dir, verbose=True)
 
 # ---- choose an episode and a scenario for printing ----
@@ -121,6 +126,8 @@ else:
 
 
 # Loading topology
+
+# Global container
 topologies = {}
 
 def load_topologies_from_directory(topology_dir):
@@ -152,7 +159,8 @@ def load_topologies_from_directory(topology_dir):
                 "meta_data": meta_data,
                 "connection_matrix": connection_matrix  # Store the loaded CSV data
             }
-
+            
+            
 load_topologies_from_directory(topology_dir)
 
 print('topology clustered -> connection_matrix')
@@ -170,6 +178,12 @@ print(topologies['clustered']['meta_data'])
 
 
 # 1.2. Data Validation (episode-first aware)
+
+# Before using the data, we must validate that required columns exist and that IDs match properly.
+# **The code below performs three layers of checks:** 
+# - Validate each dataset (episodes/agents/arrivals/tasks)
+# - Validate each topology (JSON and connection matrix)
+# - Validate dataset–topology pairs for unit alignment and overall consistency
 
 # ---------- Generic helpers ----------
 def _require(cond: bool, msg: str, errors: list):
@@ -428,7 +442,8 @@ def print_validation_report_episode_first(report: dict):
         print(f"[{status}] {key}")
         for e in info["errors"]:
             print(f"  - {e}")
-
+            
+            
 # ---- run the new validator ----
 report = validate_everything_episode_first(datasets, topologies)
 print_validation_report_episode_first(report)
@@ -454,8 +469,6 @@ if not all_ok:
 #     agents.f_local_slot (cycles/slot), tasks.deadline_slots (integer or NaN)
 # - Topologies: capacities are already per-slot (generator multiplied by Δ);
 #     we only verify time_step == Delta and non-negative capacities.
-
-from typing import Dict, Any, Tuple
 
 # ===== Helpers: safe getters =====
 def _get_delta(episodes_df: pd.DataFrame) -> float:
@@ -634,7 +647,8 @@ def print_alignment_summary_episode_first(result: Dict[str, Any]):
                 r = by_ep[ep_name][scenario]
                 flag = "OK" if r["ok"] else "FAIL"
                 print(f"  - {ep_name}/{scenario}: {flag}  -> {r['message']}")
-
+                
+                
 # ==== Example driver (after your loading step) ====
 # datasets: episode-first dict
 # topologies: { "full_mesh": {...}, "clustered": {...}, "sparse_ring": {...} }
@@ -643,15 +657,19 @@ result_align = align_all_units_episode_first(datasets_ep_first=datasets, topolog
 print_alignment_summary_episode_first(result_align)
 
 # Access aligned data for a specific episode/scenario:
-# aligned_light_ep0 = result_align["datasets_aligned"]["ep_000"]["light"]
-# agents_ep0_light  = aligned_light_ep0["agents"]   # has f_local_slot
-# tasks_ep0_light   = aligned_light_ep0["tasks"]    # has deadline_slots
+print("\n ===EXAMPLE===")
+aligned_light_ep0 = result_align["datasets_aligned"]["ep_000"]["light"]
+agents_ep0_light  = aligned_light_ep0["agents"]   # has f_local_slot
+tasks_ep0_light   = aligned_light_ep0["tasks"]    # has deadline_slots
 
 
 
 
 
-# 1.4. Build Scenario–Topology Pairs (episode-first aware)
+# 1.4. Build Scenario–Topology Pairs
+
+# In this step, all datasets are paired with all topologies (Cartesian product). 
+# Each pair is checked for matching time parameters, then a basic bundle is created for further enrichment.
 
 # We pair every (episode, scenario) dataset with every topology.
 # Output shape:
@@ -673,8 +691,6 @@ print_alignment_summary_episode_first(result_align)
 #       }, ...
 #   }, ...
 # }
-
-from typing import Dict, Any
 
 def _delta_from_episodes(episodes_df: pd.DataFrame) -> float:
     """Extract a single Delta value from episodes table."""
@@ -774,6 +790,7 @@ def print_pairs_summary_topology_first_ep(
                 msg   = bundle["checks"]["message"]
                 print(f"  │    - [{flag}] {scen_name:9s} | K={K:2d}  Δ={Delta:g}  -> {msg}")
 
+
 # --- Example driver (with your current variables) ---
 pairs_by_topology = build_topology_episode_pairs(
     datasets_ep_first=datasets,   # episode-first dict you already built
@@ -784,14 +801,19 @@ pairs_by_topology = build_topology_episode_pairs(
 print_pairs_summary_topology_first_ep(pairs_by_topology)
 
 # Access examples:
-# pairs_by_topology["full_mesh"]["ep_000"]["light"]["dataset"]["tasks"]
-# pairs_by_topology["clustered"]["ep_000"]["heavy"]["connection_matrix_df"]
+print("\n ===EXAMPLE===")
+pairs_by_topology["full_mesh"]["ep_000"]["light"]["dataset"]["tasks"]
+pairs_by_topology["clustered"]["ep_000"]["heavy"]["connection_matrix_df"]
 
 
 
 
 
-# 1.5. Agent→MEC mapping (for all pairs) — 3-level: topology → episode → scenario
+# 1.5. Agent→MEC mapping (for all pairs)
+
+# Agent → MEC Mapping assigns each agent to a specific MEC server.
+# This creates a fixed mec_id for every agent (e.g., agent_id % K), 
+# which determines where its tasks are initially queued and processed in the MDP environment.
 
 def assign_agents_to_mecs(pairs_by_topology):
     """
@@ -832,152 +854,13 @@ def assign_agents_to_mecs(pairs_by_topology):
 
     return pairs_by_topology
 
+
 # Apply mapping
 pairs_by_topology = assign_agents_to_mecs(pairs_by_topology)
 
 # Quick sanity peek
+print("\n ===EXAMPLE===")
 pairs_by_topology["clustered"]["ep_000"]["heavy"]["dataset"]["agents"].head()
-
-
-def _extract_core_from_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
-    required = ["dataset", "topology_data", "connection_matrix_df", "Delta", "K"]
-    for k in required:
-        if k not in bundle:
-            raise ValueError(f"Bundle missing required key: '{k}'")
-
-    ds   = bundle["dataset"]
-    topo = bundle["topology_data"]
-    Mdf  = bundle["connection_matrix_df"]
-
-    private_cpu = np.asarray(topo["private_cpu_capacities"], dtype=float)
-    public_cpu  = np.asarray(topo["public_cpu_capacities"],  dtype=float)
-    cloud_cpu   = float(topo["cloud_computational_capacity"])
-    M           = Mdf.to_numpy(dtype=float)  # (K, K+1), last col MEC→Cloud (MB/slot)
-
-    return dict(
-        Delta=float(bundle["Delta"]),
-        K=int(bundle["K"]),
-        episodes=ds["episodes"],
-        agents=ds["agents"],
-        arrivals=ds["arrivals"],
-        tasks=ds["tasks"],
-        private_cpu=private_cpu,
-        public_cpu=public_cpu,
-        cloud_cpu=cloud_cpu,
-        connection_matrix=M,
-        topology_type=topo.get("topology_type", "unknown"),
-    )
-
-def _build_default_queues(K: int) -> Dict[str, np.ndarray]:
-    return {
-        "mec_local_cycles":   np.zeros(K, dtype=float),
-        "mec_public_cycles":  np.zeros(K, dtype=float),
-        "mec_bytes_in_transit": np.zeros(K, dtype=float),
-        "cloud_cycles":       np.array([0.0], dtype=float),
-    }
-
-def _derive_action_space() -> Dict[str, Any]:
-    return {"type": "discrete", "n": 3, "labels": {0: "LOCAL", 1: "MEC", 2: "CLOUD"}}
-
-def _derive_state_spec(K: int) -> Dict[str, Any]:
-    return {
-        "components": {
-            "queues": {
-                "mec_local_cycles":  {"shape": (K,),   "dtype": "float"},
-                "mec_public_cycles": {"shape": (K,),   "dtype": "float"},
-                "cloud_cycles":      {"shape": (1,),   "dtype": "float"},
-            },
-            "links": {
-                "connection_matrix": {"shape": (K, K+1), "dtype": "float"},
-            },
-            "capacities": {
-                "private_cpu": {"shape": (K,), "dtype": "float"},
-                "public_cpu":  {"shape": (K,), "dtype": "float"},
-                "cloud_cpu":   {"shape": (1,), "dtype": "float"},
-            }
-        },
-        "note": "Declarative spec; tensor assembly happens in the Env at each step."
-    }
-
-def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
-    core = _extract_core_from_bundle(bundle)
-
-    if "agent_to_mec" not in bundle:
-        raise ValueError("Bundle has no 'agent_to_mec' mapping. Run Stage 5 first.")
-
-    agent_to_mec = bundle["agent_to_mec"]
-    if isinstance(agent_to_mec, pd.Series):
-        # reorder by agent_id if needed
-        if agent_to_mec.index.name != "agent_id":
-            agent_to_mec.index.name = "agent_id"
-        # enforce index = 0..N_agents-1
-        idx = core["agents"].sort_values("agent_id")["agent_id"].to_numpy()
-        agent_to_mec = agent_to_mec.reindex(idx)
-        agent_to_mec_arr = agent_to_mec.to_numpy(dtype=int)
-    else:
-        agent_to_mec_arr = np.asarray(agent_to_mec, dtype=int)
-
-    N_agents = int(core["episodes"]["N_agents"].iloc[0])
-    if len(agent_to_mec_arr) != N_agents:
-        raise ValueError(f"agent_to_mec length ({len(agent_to_mec_arr)}) != N_agents ({N_agents}).")
-
-    queues_init = _build_default_queues(core["K"])
-    action_space = _derive_action_space()
-    state_spec   = _derive_state_spec(core["K"])
-
-    env_config = {
-        "Delta": core["Delta"],
-        "K": core["K"],
-        "topology_type": core["topology_type"],
-        "connection_matrix": core["connection_matrix"],
-
-        "private_cpu": core["private_cpu"],
-        "public_cpu":  core["public_cpu"],
-        "cloud_cpu":   core["cloud_cpu"],
-
-        "N_agents": N_agents,
-        "agent_to_mec": agent_to_mec_arr,
-
-        # aligned dataframes (include f_local_slot, deadline_slots if شما قبلاً افزوده‌اید)
-        "episodes": core["episodes"],
-        "agents":   core["agents"],
-        "arrivals": core["arrivals"],
-        "tasks":    core["tasks"],
-
-        "queues_initial": queues_init,
-        "action_space": action_space,
-        "state_spec": state_spec,
-
-        "checks": bundle.get("checks", {"delta_match": True, "message": "n/a"}),
-    }
-    return env_config
-
-def build_all_env_configs(pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
-) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
-    """
-    Build env_config for every (topology / episode / scenario) bundle.
-
-    Output shape:
-        env_configs[topology][episode][scenario] = env_config
-    """
-    out: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
-    for topo_name, by_ep in pairs_by_topology.items():
-        out[topo_name] = {}
-        for ep_name, by_scen in by_ep.items():
-            out[topo_name][ep_name] = {}
-            for scen_name, bundle in by_scen.items():
-                if "agent_to_mec" not in bundle:
-                    raise RuntimeError(f"[{topo_name}/{ep_name}/{scen_name}] missing 'agent_to_mec'. Run Stage 5 first.")
-                env_cfg = build_env_config_for_bundle(bundle)
-                out[topo_name][ep_name][scen_name] = env_cfg
-    return out
-
-# Build
-env_configs = build_all_env_configs(pairs_by_topology)
-
-# Example access:
-# env_configs["clustered"]["ep_000"]["heavy"]["agent_to_mec"]
-# env_configs["full_mesh"]["ep_001"]["moderate"]["connection_matrix"]
 
 
 
@@ -986,10 +869,10 @@ env_configs = build_all_env_configs(pairs_by_topology)
 # 1.6. Environment Configuration
 
 # In this step, we build a unified env_config for each scenario–topology pair.
-# It bundles all required information for the MDP/RL environment—such as compute capacities,
+# It bundles all required information for the MDP/RL environment—such as compute capacities, 
     # the Agent→MEC mapping, connection matrix, initial queue states, and action/state specifications—into
     # a single consistent configuration used by the RL training process.
-    
+
 def _extract_core_from_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     required = ["dataset", "topology_data", "connection_matrix_df", "Delta", "K"]
     for k in required:
@@ -1049,7 +932,7 @@ def _derive_state_spec(K: int) -> Dict[str, Any]:
         },
         "note": "Declarative spec; tensor assembly happens in the Env at each step."
     }
-    
+
 def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     core = _extract_core_from_bundle(bundle)
 
@@ -1102,7 +985,6 @@ def build_env_config_for_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     }
     return env_config
 
-
 def build_all_env_configs(
     pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
@@ -1139,7 +1021,8 @@ def build_all_env_configs(
 env_configs = build_all_env_configs(pairs_by_topology)
 
 # Example access:
-env_configs["clustered"]["ep_000"]["heavy"]["agent_to_mec"]
+print("\n ===EXAMPLE===")
+env_configs["ep_000"]["clustered"]["heavy"]["agent_to_mec"]
 
 
 
@@ -1200,10 +1083,125 @@ def sanity_check_all(env_configs):
                         print("   -", e)
                 else:
                     print(f"[OK]   {topo_name}/{ep_name}/{scen_name}")
-
+                    
+                    
 # Run all sanity checks
 sanity_check_all(env_configs)
 
+print("env_configs: \n", env_configs)
+
+print("\n ===EXAMPLE===")
+print(env_configs["ep_000"]["clustered"]["heavy"]["tasks"])
+
+
+# Saving the Information
+
+def _summarize_array(arr, max_items=6):
+    """Return a short, readable summary string for numpy arrays."""
+    try:
+        arr = np.asarray(arr)
+        base = f"ndarray shape={arr.shape}, dtype={arr.dtype}"
+        if arr.size == 0:
+            return base + " | empty"
+        # Show a few values only if it's 1D or small
+        if arr.ndim == 1 and arr.size <= max_items:
+            return base + f" | values={arr.tolist()}"
+        # Stats if numeric
+        if np.issubdtype(arr.dtype, np.number):
+            return base + f" | min={np.nanmin(arr):.4g}, max={np.nanmax(arr):.4g}, mean={np.nanmean(arr):.4g}"
+        return base
+    except Exception as e:
+        return f"(array summary failed: {e})"
+
+def _summarize_df(df: pd.DataFrame, max_cols=10):
+    """Return a short summary string for DataFrames."""
+    try:
+        cols = df.columns.tolist()
+        cols_show = cols[:max_cols] + (["..."] if len(cols) > max_cols else [])
+        return f"DataFrame shape={df.shape}, columns={cols_show}"
+    except Exception as e:
+        return f"(dataframe summary failed: {e})"
+
+def _summarize_any(name, obj, indent="    "):
+    """Create a few readable lines summarizing an object by type."""
+    lines = []
+    if isinstance(obj, pd.DataFrame):
+        lines.append(f"{indent}{name}: {_summarize_df(obj)}")
+    elif isinstance(obj, np.ndarray):
+        lines.append(f"{indent}{name}: {_summarize_array(obj)}")
+    elif isinstance(obj, (list, tuple)):
+        preview = obj[:6] if len(obj) > 6 else obj
+        lines.append(f"{indent}{name}: list len={len(obj)}, preview={preview}")
+    elif isinstance(obj, dict):
+        lines.append(f"{indent}{name}: dict keys={list(obj.keys())}")
+        # If it's the queues dict or small dict, briefly dive one level
+        if name == "queues_initial" or len(obj) <= 6:
+            for k, v in obj.items():
+                sub = _summarize_any(k, v, indent=indent + "  ")
+                lines.extend(sub if isinstance(sub, list) else [sub])
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        lines.append(f"{indent}{name}: {repr(obj)}")
+    else:
+        # Try numpy conversion
+        try:
+            arr = np.asarray(obj)
+            lines.append(f"{indent}{name}: {_summarize_array(arr)}")
+        except Exception:
+            lines.append(f"{indent}{name}: ({type(obj).__name__})")
+    return lines
+
+def save_env_configs_text(env_configs, out_path="./artifacts/env_configs_summary.txt"):
+    """
+    Save a human-readable summary of env_configs (episode → topology → scenario) to a text file.
+    Includes shapes of DataFrames, key columns, array shapes/stats, and key scalar parameters.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    lines = []
+    lines.append("=== ENV CONFIGS SUMMARY (episode → topology → scenario) ===\n")
+
+    # Iterate deterministic order for reproducibility
+    for ep_name in sorted(env_configs.keys()):
+        lines.append(f"[EPISODE] {ep_name}")
+        by_topo = env_configs[ep_name]
+        for topo_name in sorted(by_topo.keys()):
+            lines.append(f"  [TOPOLOGY] {topo_name}")
+            by_scen = by_topo[topo_name]
+            for scen_name in sorted(by_scen.keys()):
+                env_cfg = by_scen[scen_name]
+                lines.append(f"    [SCENARIO] {scen_name}")
+
+                # Highlight most relevant scalars first if present
+                for key in ["Delta", "K", "N_agents", "topology_type"]:
+                    if key in env_cfg:
+                        lines.extend(_summarize_any(key, env_cfg[key], indent="      "))
+
+                # Then summarize major tensors/arrays
+                for key in ["connection_matrix", "private_cpu", "public_cpu", "cloud_cpu", "agent_to_mec"]:
+                    if key in env_cfg:
+                        lines.extend(_summarize_any(key, env_cfg[key], indent="      "))
+
+                # Then summarize DataFrames (episodes, agents, arrivals, tasks)
+                for key in ["episodes", "agents", "arrivals", "tasks"]:
+                    if key in env_cfg:
+                        lines.extend(_summarize_any(key, env_cfg[key], indent="      "))
+
+                # Queues + RL descriptors (optional)
+                for key in ["queues_initial", "action_space", "state_spec", "checks"]:
+                    if key in env_cfg:
+                        lines.extend(_summarize_any(key, env_cfg[key], indent="      "))
+
+                lines.append("")  # blank line between scenarios
+
+            lines.append("")  # blank line between topologies
+        lines.append("")      # blank line between episodes
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"[saved] env_configs summary → {out_path}")
+
+# ---- usage ----
+save_env_configs_text(env_configs, out_path="./artifacts/env_configs_summary.txt")
 
 # At Step 1, we have loaded the data, aligned the units, assigned agents to MECs, 
 # and prepared the environment configuration. Finally, we have performed consistency checks to ensure the data is correct. 
@@ -1391,8 +1389,10 @@ env_configs, label_summary = label_all_tasks_in_env_configs(
 )
 
 # Example access:
+print("\n ===EXAMPLE===")
 labeled_tasks = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
-labeled_tasks.head()
+print(labeled_tasks.head())
+print(labeled_tasks.info())
 
 
 
@@ -1400,11 +1400,8 @@ labeled_tasks.head()
 
 # 2.2. Task Type Classification
 
-# === Chapter-4 Task Typing (priority rules) ===
 # Pre-req: tasks already labeled by your previous step: 
 #   size_bucket, compute_bucket, mem_bucket, urgency, atomicity, split_bucket, routing_hint, etc.
-
-from typing import Dict, Any
 
 def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list]:
     """
@@ -1456,7 +1453,6 @@ def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list]:
     # 5) Otherwise general
     return ("general", "general", "no dominant constraint", multi_flags)
 
-
 def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds Chapter-4 level task classes with priority rules into tasks_df (returns a COPY).
@@ -1495,7 +1491,6 @@ def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, Any]]],
                                      verbose: bool = True) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
@@ -1520,17 +1515,74 @@ def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, 
                     print(f"[typing] {ep_name}/{topo_name}/{scen_name}  n={n}  → {counts}")
     return env_configs
 
+
 # ---- Run typing on your current env_configs (episode → topology → scenario) ----
 env_configs = apply_task_typing_in_env_configs(env_configs, verbose=True)
 
 # Example access:
+print("\n ===EXAMPLE===")
 env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags"]].head()
 
 
+df = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
+print(df["urgency"].value_counts())
+print("\n", df["task_type"].value_counts())
+print("\n", df.groupby("task_type")[["b_mb","rho_cyc_per_mb","mem_mb"]].median())
+
+
+# Example access:
+labeled_tasks_completed = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
+labeled_tasks_completed.head()
+labeled_tasks_completed.info()
+
+
+# Saving the Information
+
+def _ensure_dir(path: str):
+    """Create folder if it doesn't exist."""
+    os.makedirs(path, exist_ok=True)
+
+def save_all_env_configs(env_configs, out_root: str = "./artifacts/env_configs"):
+    """
+    Walk through env_configs (episode → topology → scenario) and save all data (tasks, agents, etc.) as CSV.
+    Example output: ./artifacts/env_configs/ep_000/clustered/heavy/env_config.csv
+    """
+    n_saved = 0
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+                out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+                _ensure_dir(out_dir)
+
+                # Save tasks, agents, arrivals, and other components
+                for df_name, df in env_cfg.items():
+                    if isinstance(df, pd.DataFrame):
+                        file_path_csv = os.path.join(out_dir, f"{df_name}_env_config.csv")
+                        # file_path_pq = os.path.join(out_dir, f"{df_name}_env_config.parquet")
+
+                        df.to_csv(file_path_csv, index=False)
+                        # try:
+                        #     df.to_parquet(file_path_pq, index=False)  # optional
+                        # except Exception:
+                        #     pass
+
+                        print(f"[saved] {file_path_csv}  (rows={len(df)})")
+                        n_saved += 1
+
+    print(f"Done. Saved {n_saved} dataframes for env_configs (episode, topology, scenario).")
+
+# Save ALL env_configs
+save_all_env_configs(env_configs, out_root="./artifacts/env_configs")
 
 
 
-# Step 3 — Agent Profiling (full cell, revised)
+
+
+# Step 3: Agent Profiling
+
+# In this step, we construct a behavioral profile for each agent, capturing its local compute resources, 
+    # task arrival rate, and the distribution of task types it generates. These profiles are later used for 
+    # clustering agents and assigning suitable reinforcement learning strategies to each group.
 
 # ---- Helper 1: per-agent per-slot arrival counts ----
 def _per_agent_slot_counts(arrivals_df: pd.DataFrame) -> pd.DataFrame:
@@ -1735,11 +1787,26 @@ def build_all_agent_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
                 env_cfg["agent_profiles"] = prof  # attach for direct access
     return out
 
+
 # ---- Build + quick peek (optional) ----
 agent_profiles = build_all_agent_profiles(env_configs)
 
 # Example: Access the profile table for a specific episode / topology / scenario
+print("\n ===EXAMPLE===")
 print(agent_profiles["ep_000"]["clustered"]["heavy"].head())
 
 # Alternatively, read directly from env_configs:
-# display(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head())
+print(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head())
+
+
+
+
+
+# Step 4: Clustering Agents
+
+# 4.1. Feature Matrix
+
+# To perform clustering, the characteristics of each agent must first be stored in a feature matrix. These characteristics include:
+    # 1) Local resources
+    # 2) task generation pattern
+    
