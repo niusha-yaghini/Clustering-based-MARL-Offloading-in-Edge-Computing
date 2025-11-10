@@ -1403,15 +1403,10 @@ print(labeled_tasks.info())
 # Pre-req: tasks already labeled by your previous step: 
 #   size_bucket, compute_bucket, mem_bucket, urgency, atomicity, split_bucket, routing_hint, etc.
 
-def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list]:
+def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list, str]:
     """
-    Returns (task_type, task_subtype, type_reason, multi_flags)
-      task_type   ∈ {"deadline_hard","latency_sensitive","compute_intensive","data_intensive","general"}
-      task_subtype: finer note (e.g., "deadline_hard", "deadline_soft", ...)
-      type_reason: short human-readable reason
-      multi_flags: list of boolean tags that were true (for auditing)
+    Returns (task_type, task_subtype, type_reason, multi_flags, final_flag)
     """
-
     # Collect boolean flags consistent with your earlier labeling:
     urgency        = str(row.get("urgency", "none"))         # "hard" | "soft" | "none"
     latency_flag   = (urgency == "hard") or (urgency == "soft")
@@ -1434,24 +1429,27 @@ def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list]:
     # --- Priority resolution (Chapter 4) ---
     # 1) Hard deadline dominates everything
     if hard_deadline:
-        return ("deadline_hard", "deadline_hard", "hard deadline (tight slots)", multi_flags)
+        final_flag = "deadline_hard"
+        return ("deadline_hard", "deadline_hard", "hard deadline (tight slots)", multi_flags, final_flag)
 
     # 2) Latency-sensitive (soft deadlines / delay-sensitive)
     if latency_flag:
-        return ("latency_sensitive", "deadline_soft", "delay-sensitive (soft deadline)", multi_flags)
+        final_flag = "latency_sensitive"
+        return ("latency_sensitive", "deadline_soft", "delay-sensitive (soft deadline)", multi_flags, final_flag)
 
     # 3) Compute-intensive (c or rho or mem heavy)
-    #    You may decide whether memory_heavy alone pushes to compute_intensive or creates a separate class.
-    #    Based on Chapter 4 text we map memory_heavy into compute_intensive family.
     if compute_heavy or memory_heavy:
-        return ("compute_intensive", "compute_or_memory_heavy", "high compute/memory demand", multi_flags)
+        final_flag = "compute_intensive"
+        return ("compute_intensive", "compute_or_memory_heavy", "high compute/memory demand", multi_flags, final_flag)
 
     # 4) Data-intensive (mainly large input size / high IO pressure)
     if io_heavy:
-        return ("data_intensive", "large_input_bandwidth", "large data volume / IO heavy", multi_flags)
+        final_flag = "data_intensive"
+        return ("data_intensive", "large_input_bandwidth", "large data volume / IO heavy", multi_flags, final_flag)
 
     # 5) Otherwise general
-    return ("general", "general", "no dominant constraint", multi_flags)
+    final_flag = "general"
+    return ("general", "general", "no dominant constraint", multi_flags, final_flag)
 
 def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1461,6 +1459,7 @@ def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
       - task_subtype         (finer descriptor)
       - type_reason          (short textual rationale)
       - multi_flags          (list of all active boolean traits)
+      - final_flag           (single flag representing the task's priority class)
     """
     df = tasks_df.copy()
 
@@ -1470,18 +1469,21 @@ def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"apply_ch4_task_typing: missing label columns: {missing}")
 
-    out_type, out_sub, out_reason, out_flags = [], [], [], []
+    out_type, out_sub, out_reason, out_flags, out_final_flag = [], [], [], [], []
     for _, r in df.iterrows():
-        t, s, msg, flags = _derive_task_type_row(r)
+        t, s, msg, flags, final_flag = _derive_task_type_row(r)
         out_type.append(t)
         out_sub.append(s)
         out_reason.append(msg)
         out_flags.append(flags)
+        out_final_flag.append(final_flag)
 
     df["task_type"]   = out_type
     df["task_subtype"]= out_sub
     df["type_reason"] = out_reason
     df["multi_flags"] = out_flags
+    df["final_flag"]  = out_final_flag  # Add the final flag to represent the primary category
+
     # For convenience: one-hot view (optional)
     df["is_general"]            = (df["task_type"] == "general")
     df["is_deadline_hard"]      = (df["task_type"] == "deadline_hard")
@@ -1523,17 +1525,16 @@ env_configs = apply_task_typing_in_env_configs(env_configs, verbose=True)
 print("\n ===EXAMPLE===")
 env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags"]].head()
 
+# none → Tasks that do not have a specific deadline or time sensitivity </br>
+# hard → Tasks that have a very limited deadline and delay is very important to them
 
-df = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
-print(df["urgency"].value_counts())
-print("\n", df["task_type"].value_counts())
-print("\n", df.groupby("task_type")[["b_mb","rho_cyc_per_mb","mem_mb"]].median())
-
-
-# Example access:
 labeled_tasks_completed = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
-labeled_tasks_completed.head()
-labeled_tasks_completed.info()
+print(labeled_tasks_completed["urgency"].value_counts())
+print("\n", labeled_tasks_completed["task_type"].value_counts())
+print("\n", labeled_tasks_completed.groupby("task_type")[["b_mb","rho_cyc_per_mb","mem_mb"]].median())
+
+print(labeled_tasks_completed.head())
+print(labeled_tasks_completed.info())
 
 
 # Saving the Information
