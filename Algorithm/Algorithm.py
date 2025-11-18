@@ -1811,3 +1811,1269 @@ print(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head())
     # 1) Local resources
     # 2) task generation pattern
     
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Any, Tuple, Optional
+from sklearn.preprocessing import StandardScaler
+
+# STEP 4.1 – Agent Feature Matrix Construction
+
+# The feature matrix combines two key components:
+#   (1) Local resource capacities (hardware characteristics)
+#   (2) Task generation patterns (behavioral characteristics)
+# 
+# The resulting matrix (X) is used for clustering agents in Step 4.2.
+
+
+AGENT_FEATURES_V1 = [
+    # ---- (1) Local resources ----
+    "f_local_slot",   # Local CPU cycles per slot
+    "m_local",        # Local memory capacity
+    "lambda_mean",    # Mean task arrival rate
+    "lambda_var",     # Variance of task arrival rate
+
+    # ---- (2) Task generation pattern ----
+    # Derived from labeled task distribution across final_flag categories
+    "P_deadline_hard",
+    "P_latency_sensitive",
+    "P_compute_intensive",
+    "P_data_intensive",
+    "P_general",
+
+    # ---- (optional statistical descriptors of generated tasks) ----
+    "b_mb_med",       # Median input size
+    "rho_med",        # Median compute demand (cycles/MB)
+    "mem_med",        # Median memory demand (MB)
+    "non_atomic_share", # Share of splittable tasks
+    "hard_share"        # Share of hard-deadline tasks
+]
+
+# Utility: Keep only existing columns; others will be filled with zeros
+def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+# Build feature matrix for one environment configuration
+def make_agent_feature_matrix_for_env(
+    env_cfg: Dict[str, Any],
+    feature_list: Optional[List[str]] = None,
+    standardize: bool = True,
+) -> Tuple[np.ndarray, List[str], np.ndarray, Optional[StandardScaler]]:
+    """
+    Build the feature matrix (X) for all agents in one environment configuration.
+    Each row represents an agent; each column a numerical feature.
+    
+    Returns:
+        X_scaled       : np.ndarray (n_agents × n_features)
+        used_cols      : list of feature names in order
+        agent_ids      : np.ndarray of agent identifiers
+        scaler         : fitted StandardScaler object (or None if not standardized)
+    """
+    if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
+        raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
+
+    prof = env_cfg["agent_profiles"].copy()
+    if "agent_id" not in prof.columns:
+        raise ValueError("agent_profiles must include column 'agent_id'.")
+
+    if feature_list is None:
+        feature_list = AGENT_FEATURES_V1
+
+    # Keep valid features and fill missing ones with zeros
+    cols = _safe_cols(prof, feature_list)
+    X = prof.reindex(columns=cols).fillna(0.0).astype(float).to_numpy()
+    agent_ids = prof["agent_id"].to_numpy(dtype=int)
+
+    # Standardize features (mean=0, std=1) for clustering stability
+    scaler = None
+    if standardize and X.shape[0] > 0:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+
+    return X, cols, agent_ids, scaler
+
+# Attach computed features to the environment configuration
+def attach_features_to_env(env_cfg: Dict[str, Any],
+                           feature_list: Optional[List[str]] = None,
+                           standardize: bool = True) -> Dict[str, Any]:
+    """
+    Attach the constructed feature matrix and related metadata
+    to env_cfg["clustering"]["features"].
+    """
+    X, cols, agent_ids, scaler = make_agent_feature_matrix_for_env(env_cfg, feature_list, standardize)
+
+    env_cfg.setdefault("clustering", {})
+    env_cfg["clustering"]["features"] = {
+        "X": X,                          # Feature matrix (scaled)
+        "feature_cols": cols,            # List of column names
+        "agent_ids": agent_ids,          # Agent identifiers
+        "scaler": scaler,                # StandardScaler (for later inverse transform)
+        "n_agents": int(X.shape[0]),
+        "n_features": int(X.shape[1]),
+    }
+    return env_cfg
+
+# Apply feature construction to all topology-scenario combinations
+def attach_features_to_all_envs(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    feature_list: Optional[List[str]] = None,
+    standardize: bool = True,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Iterate through all (episode → topology → scenario) combinations
+    and build the feature matrix for each one.
+    """
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+                env_configs[ep_name][topo_name][scen_name] = attach_features_to_env(
+                    env_cfg, feature_list, standardize
+                )
+                fz = env_configs[ep_name][topo_name][scen_name]["clustering"]["features"]
+                print(f"[features] {ep_name}/{topo_name}/{scen_name} "
+                      f"-> X.shape={fz['X'].shape}  (agents={fz['n_agents']}, feats={fz['n_features']})")
+    return env_configs
+
+
+def _assert_no_nan_inf(X: np.ndarray, where: str):
+    if not np.isfinite(X).all():
+        bad = np.isnan(X).sum(), np.isinf(X).sum()
+        raise AssertionError(f"{where}: Feature matrix contains NaN or Inf. counts={bad}")
+
+def _assert_agent_count_match(env_cfg: Dict[str, Any], where: str):
+    n_agents_ep = int(env_cfg["episodes"]["N_agents"].iloc[0])
+    n_agents_prof = len(env_cfg["agent_profiles"])
+    fz = env_cfg["clustering"]["features"]
+    if not (fz["n_agents"] == n_agents_prof == n_agents_ep):
+        raise AssertionError(
+            f"{where}: Agent count mismatch. episodes={n_agents_ep}, "
+            f"profiles={n_agents_prof}, X={fz['n_agents']}"
+        )
+
+def _assert_feature_prob_sum_hint(env_cfg: Dict[str, Any], tol=1e-3):
+    prof = env_cfg["agent_profiles"]
+    if "TaskDist_sum" in prof.columns and "n_tasks_agent" in prof.columns:
+        mask = prof["n_tasks_agent"] > 0
+        if mask.any():
+            mean_sum = float(prof.loc[mask, "TaskDist_sum"].mean())
+            if abs(mean_sum - 1.0) > tol:
+                print(f"[warn] Mean(TaskDist_sum)={mean_sum:.4f} ≠ 1 (tol={tol})")
+
+def run_feature_matrix_sanity_checks(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+                where = f"{ep_name}/{topo_name}/{scen_name}"
+                if "clustering" not in env_cfg or "features" not in env_cfg["clustering"]:
+                    raise AssertionError(f"{where}: Missing features.")
+                X = env_cfg["clustering"]["features"]["X"]
+                _assert_no_nan_inf(X, where)
+                _assert_agent_count_match(env_cfg, where)
+                _assert_feature_prob_sum_hint(env_cfg)
+                if X.shape[1] == 0:
+                    raise AssertionError(f"{where}: Empty feature matrix.")
+    print("[checks] All sanity checks passed successfully.")
+    
+
+# Build feature matrices for all envs
+env_configs = attach_features_to_all_envs(env_configs, feature_list=AGENT_FEATURES_V1, standardize=True)
+
+# Run sanity checks
+run_feature_matrix_sanity_checks(env_configs)
+
+# Example inspection
+print("\n=== EXAMPLE: features of ep_000 / clustered / heavy ===")
+fz = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["features"]
+print("X.shape:", fz["X"].shape)
+print("feature_cols:", fz["feature_cols"])
+print("agent_ids (first 10):", fz["agent_ids"][:10])
+
+
+# print("missing features:",
+#       [c for c in AGENT_FEATURES_V1 if c not in prof.columns])
+
+# print(prof[ [c for c in AGENT_FEATURES_V1 if c in prof.columns] ].head())
+
+
+fz = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["features"]
+print("X.shape:", fz["X"].shape)
+print("feature_cols actually used:", fz["feature_cols"])
+print("agent_ids[:10]:", fz["agent_ids"][:10])
+
+
+
+
+
+# 4.2. Optimal Number of Clusters
+
+# To select the optimal number of clusters (K), we use a hybrid method that 
+    # combines evaluation indices such as WCSS, Silhouette, DBI, and CH Index.
+    
+import os
+import numpy as np
+import pandas as pd
+from typing import Dict, Any, List, Tuple
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    silhouette_score,
+    davies_bouldin_score,
+    calinski_harabasz_score,
+)
+import matplotlib.pyplot as plt
+
+# ===============================================
+# Step 4.2 — Selecting the number of clusters (K)
+# ===============================================
+#
+# Uses feature matrix from Step 4.1:
+#   env_cfg["clustering"]["features"] = {
+#       "X", "feature_cols", "agent_ids",
+#       "scaler", "n_agents", "n_features"
+#   }
+#
+# For each (episode → topology → scenario) we:
+#   1) Build candidate K set based on n_agents.
+#   2) Run KMeans for each K.
+#   3) Compute metrics:
+#        - inertia (WCSS)
+#        - silhouette
+#        - Calinski–Harabasz
+#        - Davies–Bouldin
+#   4) Normalize them and compute composite score:
+#        Score(K) = α·Sil_norm(K) + β·CH_norm(K) − γ·DB_norm(K)
+#   5) Compute elbow_score from inertia curvature.
+#   6) Select:
+#        best_K  = argmax(Score(K))
+#        K_elbow = argmax(elbow_score)
+#   7) Save plot: elbow + composite score per triple:
+#        ./artifacts/clustering/<ep>/<topology>/<scenario>/elbow_and_score.png
+#
+# Results are attached to:
+#   env_cfg["clustering"]["k_selection"] = {
+#       "metrics_df", "best_K", "K_elbow", "elbow_plot_path"
+#   }
+# And returned as:
+#   K_selection[ep][topology][scenario] = {...}
+# ===============================================
+
+# ---------- 4.2.1 Candidate K values ----------
+def _candidate_K_values(
+    n_agents: int,
+    k_min: int = 2,
+    max_K_fraction: float = 0.25,
+    max_K_abs: int = 10
+) -> List[int]:
+    """
+    Build a reasonable candidate set for K given n_agents.
+
+    - Lower bound is k_min (default 2).
+    - Upper bound is min(max_K_abs, floor(max_K_fraction * n_agents), n_agents - 1).
+    - If n_agents is too small, returns an empty list.
+    """
+    if n_agents <= k_min:
+        return []
+
+    k_max_by_fraction = int(np.floor(max_K_fraction * n_agents))
+    k_max = min(max_K_abs, n_agents - 1, max(k_min, k_max_by_fraction))
+
+    if k_max < k_min:
+        return []
+
+    return list(range(k_min, k_max + 1))
+
+# ---------- 4.2.2 Evaluate KMeans for a single K ----------
+def _evaluate_kmeans_for_K(
+    X: np.ndarray,
+    K: int,
+    random_state: int = 42
+) -> Dict[str, Any]:
+    """
+    Run KMeans for a given K and compute clustering metrics.
+
+    Returns:
+        {
+          "K": int,
+          "inertia": float,
+          "silhouette": float or np.nan,
+          "davies_bouldin": float or np.nan,
+          "calinski_harabasz": float or np.nan,
+        }
+    """
+    n_samples = X.shape[0]
+    result = {
+        "K": int(K),
+        "inertia": np.nan,
+        "silhouette": np.nan,
+        "davies_bouldin": np.nan,
+        "calinski_harabasz": np.nan,
+    }
+
+    if K <= 1 or K > n_samples:
+        return result
+
+    try:
+        km = KMeans(
+            n_clusters=K,
+            random_state=random_state,
+            n_init="auto"
+        )
+        labels = km.fit_predict(X)
+        result["inertia"] = float(km.inertia_)
+
+        unique_labels = np.unique(labels)
+        if unique_labels.shape[0] > 1:
+            # Silhouette
+            try:
+                result["silhouette"] = float(silhouette_score(X, labels))
+            except Exception:
+                result["silhouette"] = np.nan
+
+            # Davies–Bouldin
+            try:
+                result["davies_bouldin"] = float(davies_bouldin_score(X, labels))
+            except Exception:
+                result["davies_bouldin"] = np.nan
+
+            # Calinski–Harabasz
+            try:
+                result["calinski_harabasz"] = float(calinski_harabasz_score(X, labels))
+            except Exception:
+                result["calinski_harabasz"] = np.nan
+
+    except Exception as e:
+        print(f"[warn] KMeans failed for K={K}: {e}")
+
+    return result
+
+# ---------- 4.2.3 Min-max normalization ----------
+def _min_max_normalize(
+    arr: np.ndarray,
+    invert: bool = False
+) -> np.ndarray:
+    """
+    Min-max normalize a 1D array to [0, 1].
+
+    - If all values are NaN or the range is zero, returns NaN array.
+    - If invert=True, larger original values map to lower normalized ones.
+      (Useful if 'smaller is better' in the original metric.)
+    """
+    arr = np.asarray(arr, dtype=float)
+    if np.all(np.isnan(arr)):
+        return np.full_like(arr, np.nan)
+
+    valid = ~np.isnan(arr)
+    if valid.sum() <= 1:
+        return np.full_like(arr, np.nan)
+
+    vmin = np.nanmin(arr[valid])
+    vmax = np.nanmax(arr[valid])
+    if vmax - vmin == 0:
+        return np.full_like(arr, np.nan)
+
+    norm = (arr - vmin) / (vmax - vmin)
+    if invert:
+        norm = 1.0 - norm
+    return norm
+
+# ---------- 4.2.4 Add composite score ----------
+def _add_composite_score(
+    metrics_df: pd.DataFrame,
+    alpha: float = 0.4,
+    beta: float = 0.4,
+    gamma: float = 0.2
+) -> pd.DataFrame:
+    """
+    Given metrics_df with:
+        K, inertia, silhouette, calinski_harabasz, davies_bouldin
+
+    Add:
+        sil_norm, ch_norm, db_norm, score
+    where:
+        score = alpha * sil_norm + beta * ch_norm - gamma * db_norm
+    """
+    df = metrics_df.copy().reset_index(drop=True)
+
+    sil = df["silhouette"].to_numpy(dtype=float)
+    ch  = df["calinski_harabasz"].to_numpy(dtype=float)
+    db  = df["davies_bouldin"].to_numpy(dtype=float)
+
+    # Silhouette: higher is better
+    df["sil_norm"] = _min_max_normalize(sil, invert=False)
+
+    # Calinski–Harabasz: higher is better
+    df["ch_norm"] = _min_max_normalize(ch, invert=False)
+
+    # Davies–Bouldin: lower is better → we subtract db_norm in the score
+    df["db_norm"] = _min_max_normalize(db, invert=False)
+
+    df["score"] = (
+        alpha * df["sil_norm"].fillna(0.0)
+        + beta * df["ch_norm"].fillna(0.0)
+        - gamma * df["db_norm"].fillna(0.0)
+    )
+
+    return df
+
+# ---------- 4.2.5 Elbow score from curvature ----------
+def _compute_elbow_rank(metrics_df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute a simple 'elbow_score' based on curvature of inertia vs K.
+
+    - Normalize inertia to [0,1].
+    - Use discrete second derivative:
+        curvature_i ≈ |y_{i-1} - 2*y_i + y_{i+1}|
+    - Endpoints get curvature 0.
+    """
+    df = metrics_df.sort_values("K").reset_index(drop=True)
+    inertia = df["inertia"].to_numpy(dtype=float)
+
+    if inertia.shape[0] < 3:
+        return np.zeros_like(inertia, dtype=float)
+
+    inertia_norm = _min_max_normalize(inertia, invert=False)
+    if np.all(np.isnan(inertia_norm)):
+        return np.zeros_like(inertia, dtype=float)
+
+    curv = np.zeros_like(inertia_norm, dtype=float)
+    for i in range(1, len(inertia_norm) - 1):
+        y_prev = inertia_norm[i - 1]
+        y_curr = inertia_norm[i]
+        y_next = inertia_norm[i + 1]
+        if np.isnan(y_prev) or np.isnan(y_curr) or np.isnan(y_next):
+            curv[i] = 0.0
+        else:
+            curv[i] = abs(y_prev - 2.0 * y_curr + y_next)
+
+    curv_norm = _min_max_normalize(curv, invert=False)
+    curv_norm = np.nan_to_num(curv_norm, nan=0.0)
+    return curv_norm
+
+# ---------- 4.2.6 Select best_K and K_elbow ----------
+def _select_best_K_from_df(metrics_with_scores: pd.DataFrame) -> Tuple[int, int]:
+    """
+    Given metrics_with_scores with columns:
+        K, score, elbow_score
+
+    Returns:
+        best_K  : K with max composite score  (tie → smallest K)
+        K_elbow : K with max elbow_score     (tie → smallest K)
+    """
+    df = metrics_with_scores.sort_values("K").reset_index(drop=True)
+
+    # best_K from composite score
+    if df["score"].notna().any():
+        idx_best = df["score"].idxmax()
+    else:
+        idx_best = df["K"].idxmin()
+    best_K = int(df.loc[idx_best, "K"])
+
+    # K_elbow from elbow_score
+    if "elbow_score" in df.columns and df["elbow_score"].notna().any():
+        idx_elb = df["elbow_score"].idxmax()
+    else:
+        idx_elb = idx_best
+    K_elbow = int(df.loc[idx_elb, "K"])
+
+    return best_K, K_elbow
+
+# ---------- 4.2.7 Plot elbow + composite score ----------
+def _plot_elbow_and_scores(
+    metrics_df: pd.DataFrame,
+    ep_name: str,
+    topo_name: str,
+    scen_name: str,
+    out_root: str = "./artifacts/clustering"
+) -> str:
+    """
+    Plot:
+      - inertia (WCSS) vs K  → classic elbow
+      - composite score vs K
+
+    Save under:
+      ./artifacts/clustering/<ep>/<topology>/<scenario>/elbow_and_score.png
+    """
+    df = metrics_df.sort_values("K").reset_index(drop=True)
+
+    Ks      = df["K"].to_numpy(dtype=int)
+    inertia = df["inertia"].to_numpy(dtype=float)
+    scores  = df["score"].to_numpy(dtype=float)
+
+    out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "elbow_and_score.png")
+
+    plt.figure(figsize=(6, 4))
+
+    # Left axis: inertia (WCSS)
+    ax1 = plt.gca()
+    ax1.plot(Ks, inertia, marker="o", linestyle="-", label="WCSS (inertia)")
+    ax1.set_xlabel("Number of clusters K")
+    ax1.set_ylabel("WCSS (inertia)")
+
+    # Right axis: composite score
+    ax2 = ax1.twinx()
+    ax2.plot(Ks, scores, marker="s", linestyle="--", label="Composite score")
+    ax2.set_ylabel("Composite score")
+
+    title = f"Elbow & Score: {ep_name} / {topo_name} / {scen_name}"
+    ax1.set_title(title)
+
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    return out_path
+
+# ---------- 4.2.8 Main driver over all env_configs ----------
+def step4_2_select_K_for_all_envs(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    random_state: int = 42,
+    alpha: float = 0.4,
+    beta: float = 0.4,
+    gamma: float = 0.2,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Step 4.2: K-selection for all environments.
+
+    For each:
+        env_configs[ep_name][topology_name][scenario_name]["clustering"]["features"]["X"]
+    we:
+      - build candidate K list
+      - run KMeans for each K
+      - compute metrics + composite score
+      - compute elbow_score
+      - select best_K and K_elbow
+      - plot & save elbow figure
+      - store results in:
+            env_cfg["clustering"]["k_selection"]
+
+    Returns:
+      K_selection[ep_name][topology_name][scenario_name] = {
+        "best_K", "K_elbow", "metrics_df", "elbow_plot_path"
+      }
+    """
+    K_selection: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for ep_name, by_topo in env_configs.items():
+        K_selection[ep_name] = {}
+        for topo_name, by_scen in by_topo.items():
+            K_selection[ep_name][topo_name] = {}
+            for scen_name, env_cfg in by_scen.items():
+
+                # Check clustering features exist
+                clust = env_cfg.get("clustering", {})
+                feats = clust.get("features", None)
+                if feats is None or "X" not in feats:
+                    if verbose:
+                        print(f"[4.2/skip] {ep_name}/{topo_name}/{scen_name}: "
+                              f"no clustering features found.")
+                    continue
+
+                X = np.asarray(feats["X"], dtype=float)
+                if X.ndim != 2 or X.shape[0] == 0:
+                    if verbose:
+                        print(f"[4.2/skip] {ep_name}/{topo_name}/{scen_name}: "
+                              f"empty or invalid feature matrix.")
+                    continue
+
+                n_agents = X.shape[0]
+                K_candidates = _candidate_K_values(n_agents)
+                if not K_candidates:
+                    if verbose:
+                        print(f"[4.2/skip] {ep_name}/{topo_name}/{scen_name}: "
+                              f"not enough agents for clustering (n_agents={n_agents}).")
+                    continue
+
+                # 1) Evaluate KMeans for all candidate K
+                metrics_list = []
+                for K in K_candidates:
+                    m = _evaluate_kmeans_for_K(X, K, random_state=random_state)
+                    metrics_list.append(m)
+                metrics_df_raw = pd.DataFrame(metrics_list).sort_values("K").reset_index(drop=True)
+
+                # 2) Add composite score
+                metrics_df_full = _add_composite_score(
+                    metrics_df_raw,
+                    alpha=alpha,
+                    beta=beta,
+                    gamma=gamma
+                )
+
+                # 3) Add elbow_score
+                metrics_df_full["elbow_score"] = _compute_elbow_rank(metrics_df_full)
+
+                # 4) Select best_K and K_elbow
+                best_K, K_elbow = _select_best_K_from_df(metrics_df_full)
+
+                # 5) Plot elbow + composite score
+                elbow_plot_path = _plot_elbow_and_scores(
+                    metrics_df_full,
+                    ep_name=ep_name,
+                    topo_name=topo_name,
+                    scen_name=scen_name,
+                    out_root="./artifacts/clustering"
+                )
+
+                # 6) Attach to env_config
+                env_cfg.setdefault("clustering", {})
+                env_cfg["clustering"]["k_selection"] = {
+                    "metrics_df": metrics_df_full,
+                    "best_K": best_K,
+                    "K_elbow": K_elbow,
+                    "elbow_plot_path": elbow_plot_path,
+                }
+
+                # 7) Record summary
+                K_selection[ep_name][topo_name][scen_name] = {
+                    "best_K": best_K,
+                    "K_elbow": K_elbow,
+                    "metrics_df": metrics_df_full,
+                    "elbow_plot_path": elbow_plot_path,
+                }
+
+                if verbose:
+                    print(f"[4.2] {ep_name}/{topo_name}/{scen_name}: "
+                          f"n_agents={n_agents}, candidates={K_candidates}")
+                    print(f"      → best_K  (composite score) = {best_K}")
+                    print(f"      → K_elbow (inertia elbow)    = {K_elbow}")
+                    print(f"      → elbow plot saved at: {elbow_plot_path}")
+                    cols_show = [
+                        "K", "inertia", "silhouette",
+                        "calinski_harabasz", "davies_bouldin", "score"
+                    ]
+                    print(metrics_df_full[cols_show].round(4))
+                    print("-" * 60)
+
+    return K_selection
+
+
+# ---------- 4.2.9 Example driver ----------
+
+# After Step 4.1 (attach_features_to_all_envs + sanity checks), run:
+K_selection = step4_2_select_K_for_all_envs(
+    env_configs,
+    random_state=42,
+    alpha=0.4,
+    beta=0.4,
+    gamma=0.2,
+    verbose=True
+)
+
+print("\n=== STEP 4.2 EXAMPLE: ep_000 / clustered / heavy ===")
+ex_ep   = "ep_000"
+ex_topo = "clustered"
+ex_scen = "heavy"
+
+if (ex_ep in K_selection and
+    ex_topo in K_selection[ex_ep] and
+    ex_scen in K_selection[ex_ep][ex_topo]):
+
+    ex_sel = K_selection[ex_ep][ex_topo][ex_scen]
+    print("Chosen best_K  (composite score):", ex_sel["best_K"])
+    print("Elbow-based K_elbow             :", ex_sel["K_elbow"])
+    print("Elbow plot path                 :", ex_sel["elbow_plot_path"])
+    print("\nMetrics per K:")
+    print(
+        ex_sel["metrics_df"][
+            ["K", "inertia", "silhouette", "calinski_harabasz", "davies_bouldin", "score"]
+        ].round(4)
+    )
+else:
+    print("[warn] Example triple (ep_000/clustered/heavy) not found in K_selection.")
+    
+    
+# The checkups !!! (the charts are alike)
+
+# 1. profile differences between light/moderate/heavy
+ep   = "ep_000"
+topo = "clustered"
+
+X_light = env_configs[ep][topo]["light"]["clustering"]["features"]["X"]
+X_mod   = env_configs[ep][topo]["moderate"]["clustering"]["features"]["X"]
+X_heavy = env_configs[ep][topo]["heavy"]["clustering"]["features"]["X"]
+
+print("X_light vs X_heavy allclose:", np.allclose(X_light, X_heavy))
+print("X_light vs X_mod   allclose:", np.allclose(X_light, X_mod))
+print("shapes:", X_light.shape, X_mod.shape, X_heavy.shape)
+
+
+prof_light = env_configs[ep][topo]["light"]["agent_profiles"]
+prof_mod   = env_configs[ep][topo]["moderate"]["agent_profiles"]
+prof_heavy = env_configs[ep][topo]["heavy"]["agent_profiles"]
+
+print("profiles equal (light vs heavy):", prof_light.equals(prof_heavy))
+print("profiles equal (light vs mod)  :", prof_light.equals(prof_mod))
+
+
+# 2. Distributions differences
+targets = [
+    ("clustered", "light"),
+    ("clustered", "moderate"),
+    ("clustered", "heavy"),
+]
+
+for topo, scen in targets:
+    print(f"\n=== {ep} / {topo} / {scen} ===")
+    prof = env_configs[ep][topo][scen]["agent_profiles"]
+
+    print("\nlambda stats:")
+    print(prof[["lambda_mean", "lambda_var"]].describe())
+
+    print("\nP(task_type) stats:")
+    cols_p = [f"P_{t}" for t in ["deadline_hard","latency_sensitive",
+                                  "compute_intensive","data_intensive","general"]]
+    print(prof[cols_p].describe())
+
+    print("\nmedian task resource stats:")
+    print(prof[["b_mb_med","rho_med","mem_med"]].describe())
+
+
+# 3. metrics similarity
+for topo in ["clustered", "full_mesh", "sparse_ring"]:
+    for scen in ["light", "moderate", "heavy"]:
+        sel = K_selection["ep_000"][topo][scen]
+        dfm = sel["metrics_df"]
+        print(f"\n=== {topo} / {scen} ===")
+        print(dfm[["K","inertia","silhouette",
+                   "calinski_harabasz","davies_bouldin","score"]].round(4))
+        
+        
+
+
+
+# 4.3. Implementing K-Means Clustering
+
+# After selecting the optimal number of clusters (K_opt), we use the 
+    # K-Means algorithm for clustering.
+    
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from typing import Dict, Any
+
+# ======================================================
+# Step 4.3 — Final K-Means Clustering Using Selected K
+# ======================================================
+#
+# For each (episode → topology → scenario), we:
+#   1) Fetch best_K from step 4.2
+#   2) Run K-Means (once) using best_K
+#   3) Store:
+#        - cluster_labels (per agent)
+#        - cluster_centers (scaled feature space)
+#        - agent_ids for mapping
+#
+# Results written to:
+#   env_cfg["clustering"]["final"] = {
+#       "K": best_K,
+#       "labels": np.ndarray shape (n_agents,),
+#       "centers": np.ndarray shape (K, n_features),
+#       "agent_ids": np.ndarray
+#   }
+# ======================================================
+
+def step4_3_run_final_kmeans_for_all_envs(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    random_state: int = 42,
+    verbose: bool = True
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+
+    clustering_results = {}
+
+    for ep_name, by_topo in env_configs.items():
+        clustering_results[ep_name] = {}
+
+        for topo_name, by_scen in by_topo.items():
+            clustering_results[ep_name][topo_name] = {}
+
+            for scen_name, env_cfg in by_scen.items():
+
+                clust = env_cfg.get("clustering", {})
+                feats = clust.get("features", None)
+                k_sel = clust.get("k_selection", None)
+
+                # sanity check
+                if feats is None or "X" not in feats:
+                    if verbose:
+                        print(f"[4.3/skip] {ep_name}/{topo_name}/{scen_name}: no feature matrix.")
+                    continue
+
+                if k_sel is None or "best_K" not in k_sel:
+                    if verbose:
+                        print(f"[4.3/skip] {ep_name}/{topo_name}/{scen_name}: no K chosen.")
+                    continue
+
+                X = feats["X"]
+                agent_ids = feats["agent_ids"]
+                best_K = int(k_sel["best_K"])
+
+                if best_K <= 1 or best_K > X.shape[0]:
+                    if verbose:
+                        print(f"[4.3/skip] invalid best_K={best_K} for {ep_name}/{topo_name}/{scen_name}.")
+                    continue
+
+                # Final K-Means fit
+                km = KMeans(
+                    n_clusters=best_K,
+                    random_state=random_state,
+                    n_init="auto"
+                )
+                labels = km.fit_predict(X)
+                centers = km.cluster_centers_
+
+                # Store results
+                env_cfg["clustering"]["final"] = {
+                    "K": best_K,
+                    "labels": labels,
+                    "centers": centers,
+                    "agent_ids": agent_ids,
+                }
+
+                clustering_results[ep_name][topo_name][scen_name] = {
+                    "K": best_K,
+                    "labels": labels,
+                    "centers": centers,
+                    "agent_ids": agent_ids,
+                }
+
+                if verbose:
+                    print(f"[4.3] {ep_name}/{topo_name}/{scen_name}:")
+                    print(f"      best_K = {best_K}")
+                    print(f"      labels distribution:", np.bincount(labels))
+                    print(f"      centers shape:", centers.shape)
+                    print("-" * 50)
+
+    return clustering_results
+
+
+clustering_final = step4_3_run_final_kmeans_for_all_envs(
+    env_configs,
+    random_state=42,
+    verbose=True
+)
+
+# Example inspection
+print("\n=== STEP 4.3 EXAMPLE: ep_000 / clustered / heavy ===")
+ex = clustering_final["ep_000"]["clustered"]["heavy"]
+print("K:", ex["K"])
+print("Label counts:", np.bincount(ex["labels"]))
+print("Centers shape:", ex["centers"].shape)
+
+
+# Visualization — PCA: Display clusters in 2D space
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from typing import Dict, Any
+
+def step4_3_plot_clusters_pca(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    out_root: str = "./artifacts/clustering",
+    verbose: bool = True
+):
+    """
+    For each environment (ep/topology/scenario), take:
+        - X (scaled feature matrix)
+        - labels (final K-Means labels)
+    Project X to 2D via PCA and save scatter plot.
+
+    Output saved as:
+        <out_root>/<ep>/<topology>/<scenario>/cluster_plot_pca.png
+    """
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+
+                # Must have clustering results
+                clust = env_cfg.get("clustering", {})
+                feats = clust.get("features", None)
+                final = clust.get("final", None)
+
+                if feats is None or "X" not in feats:
+                    continue
+                if final is None or "labels" not in final:
+                    if verbose:
+                        print(f"[PCA/skip] {ep_name}/{topo_name}/{scen_name}: no final KMeans labels.")
+                    continue
+
+                X = feats["X"]
+                labels = final["labels"]
+                K = final["K"]
+
+                # PCA projection
+                pca = PCA(n_components=2, random_state=42)
+                X_2d = pca.fit_transform(X)
+
+                # Plot
+                out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, "cluster_plot_pca.png")
+
+                plt.figure(figsize=(6, 5))
+
+                for cl in np.unique(labels):
+                    mask = (labels == cl)
+                    plt.scatter(
+                        X_2d[mask, 0],
+                        X_2d[mask, 1],
+                        label=f"Cluster {cl}",
+                        alpha=0.75,
+                        s=50
+                    )
+
+                plt.title(f"PCA Clusters: {ep_name} / {topo_name} / {scen_name}  (K={K})")
+                plt.xlabel("PCA Component 1")
+                plt.ylabel("PCA Component 2")
+                plt.legend()
+                plt.grid(True)
+
+                plt.tight_layout()
+                plt.savefig(out_path, dpi=150)
+                plt.close()
+
+                if verbose:
+                    print(f"[PCA] Saved PCA cluster plot → {out_path}")
+                    
+                    
+step4_3_plot_clusters_pca(env_configs, verbose=True)
+
+
+# Visualization — spacet-SNE: Display clusters in 2D
+
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from typing import Dict, Any
+
+
+def step4_3_plot_clusters_tsne(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    out_root: str = "./artifacts/clustering",
+    perplexity: int = 5,
+    early_exaggeration: int = 12,
+    n_iter: int = 1500,
+    verbose: bool = True,
+):
+    """
+    Draw 2D t-SNE visualization for final KMeans clusters.
+    
+    Saves figure as:
+        <out_root>/<ep>/<topology>/<scenario>/cluster_plot_tsne.png
+    """
+
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+
+                clust = env_cfg.get("clustering", {})
+                feats = clust.get("features", None)
+                final = clust.get("final", None)
+
+                if feats is None or "X" not in feats:
+                    continue
+                if final is None or "labels" not in final:
+                    if verbose:
+                        print(f"[t-SNE/skip] {ep_name}/{topo_name}/{scen_name}: no cluster labels.")
+                    continue
+
+                X = feats["X"]
+                labels = final["labels"]
+                K = final["K"]
+
+                n_agents = X.shape[0]
+                if n_agents <= perplexity:
+                    if verbose:
+                        print(f"[t-SNE/skip] {ep_name}/{topo_name}/{scen_name}: "
+                              f"n_agents={n_agents} <= perplexity={perplexity}")
+                    continue
+
+                # ----- Run t-SNE -----
+                tsne = TSNE(
+                    n_components=2,
+                    perplexity=perplexity,
+                    early_exaggeration=early_exaggeration,
+                    n_iter=n_iter,
+                    init='pca',
+                    learning_rate='auto',
+                    random_state=42,
+                    metric='euclidean'
+                )
+
+                X_2d = tsne.fit_transform(X)
+
+                # ----- Plot -----
+                out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, "cluster_plot_tsne.png")
+
+                plt.figure(figsize=(6, 5))
+
+                for cl in np.unique(labels):
+                    mask = (labels == cl)
+                    plt.scatter(
+                        X_2d[mask, 0],
+                        X_2d[mask, 1],
+                        label=f"Cluster {cl}",
+                        s=50,
+                        alpha=0.8
+                    )
+
+                plt.title(f"t-SNE Clusters: {ep_name} / {topo_name} / {scen_name}  (K={K})")
+                plt.xlabel("t-SNE Dim 1")
+                plt.ylabel("t-SNE Dim 2")
+                plt.grid(True)
+                plt.legend()
+
+                plt.tight_layout()
+                plt.savefig(out_path, dpi=150)
+                plt.close()
+
+                if verbose:
+                    print(f"[t-SNE] Saved t-SNE cluster plot → {out_path}")
+                    
+
+step4_3_plot_clusters_tsne(env_configs, verbose=True)
+
+
+
+
+
+# 4.4. Cluster Interpretation & Profiling
+
+# Interpretation, Summaries, and Cluster Profiles
+
+def build_cluster_profiles_for_env(
+    ep_name: str,
+    topo_name: str,
+    scen_name: str,
+    env_cfg: Dict[str, Any],
+    out_root: str = "./artifacts/clustering"
+):
+    """
+    Build cluster representative profiles using:
+      - labels from Step 4.3 (env_cfg['clustering']['final'])
+      - scaled centers from Step 4.3
+      - inverse-transformed centers using scaler from Step 4.1
+      - agent_profiles from Step 3
+    """
+
+    # 1) Extract dependencies
+    clust = env_cfg.get("clustering", {})
+    feats = clust.get("features", None)
+    final = clust.get("final", None)   # ← این مهمه
+
+    if feats is None or "X" not in feats:
+        raise ValueError(f"[4.4] Missing features for {ep_name}/{topo_name}/{scen_name}")
+
+    if final is None or "labels" not in final or "centers" not in final:
+        raise ValueError(
+            f"[4.4] Missing final KMeans results for {ep_name}/{topo_name}/{scen_name}. "
+            f"Did you forget to run Step 4.3?"
+        )
+
+    best_K = int(final["K"])
+    labels = np.asarray(final["labels"], dtype=int)
+    centers_scaled = np.asarray(final["centers"], dtype=float)
+
+    agent_ids = feats["agent_ids"]
+    scaler = feats["scaler"]
+    feature_cols = feats["feature_cols"]
+
+    prof = env_cfg["agent_profiles"].copy()
+
+    # 2) Build assignment table
+    assign_df = pd.DataFrame({
+        "agent_id": agent_ids,
+        "cluster_id": labels
+    })
+
+    prof = prof.merge(assign_df, on="agent_id", how="left")
+
+    # 3) Cluster-level summary
+    numeric_cols = prof.select_dtypes(include=[np.number]).columns.tolist()
+
+    cluster_summary = (
+        prof[numeric_cols]
+        .groupby("cluster_id")
+        .mean()
+        .reset_index()
+        .sort_values("cluster_id")
+    )
+
+    cluster_sizes = prof.groupby("cluster_id")["agent_id"].count().rename("n_agents_cluster")
+    cluster_summary = cluster_summary.merge(
+        cluster_sizes.reset_index(), on="cluster_id", how="left"
+    )
+
+    # 4) Decode centroids back to original scale
+    if scaler is not None:
+        centers_original = scaler.inverse_transform(centers_scaled)
+    else:
+        centers_original = centers_scaled.copy()
+
+    centroids_scaled_df = pd.DataFrame(centers_scaled, columns=feature_cols)
+    centroids_scaled_df.insert(0, "cluster_id", np.arange(best_K))
+
+    centroids_original_df = pd.DataFrame(centers_original, columns=feature_cols)
+    centroids_original_df.insert(0, "cluster_id", np.arange(best_K))
+
+    # 5) Save to disk
+    out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    assign_path    = os.path.join(out_dir, "cluster_assignments.csv")
+    summary_path   = os.path.join(out_dir, "cluster_summary.csv")
+    cent_sc_path   = os.path.join(out_dir, "centroids_scaled.csv")
+    cent_orig_path = os.path.join(out_dir, "centroids_original.csv")
+
+    assign_df.to_csv(assign_path, index=False)
+    cluster_summary.to_csv(summary_path, index=False)
+    centroids_scaled_df.to_csv(cent_sc_path, index=False)
+    centroids_original_df.to_csv(cent_orig_path, index=False)
+
+    print(f"[4.4] {ep_name}/{topo_name}/{scen_name} → cluster profiles built.")
+    print(cluster_sizes)
+
+    # 6) Attach final results
+    env_cfg["clustering"]["profiles"] = {
+        "K": best_K,
+        "cluster_assignments": assign_df,
+        "cluster_summary": cluster_summary,
+        "centroids_scaled_df": centroids_scaled_df,
+        "centroids_original_df": centroids_original_df,
+        "centroids_scaled": centers_scaled,
+        "centroids_original": centers_original,
+    }
+
+    return env_cfg["clustering"]["profiles"]
+
+def build_all_cluster_profiles(env_configs):
+    out = {}
+    for ep_name, by_topo in env_configs.items():
+        out[ep_name] = {}
+        for topo_name, by_scen in by_topo.items():
+            out[ep_name][topo_name] = {}
+            for scen_name, env_cfg in by_scen.items():
+                try:
+                    prof = build_cluster_profiles_for_env(
+                        ep_name, topo_name, scen_name, env_cfg
+                    )
+                    out[ep_name][topo_name][scen_name] = prof
+                except Exception as e:
+                    print(f"[4.4/warn] skipping {ep_name}/{topo_name}/{scen_name}: {e}")
+    return out
+
+
+# ---- Run Step 4.4 on all environments ----
+cluster_profiles = build_all_cluster_profiles(env_configs)
+
+print("\n=== EXAMPLE: cluster summary for ep_000 / clustered / heavy ===")
+ex_ep   = "ep_000"
+ex_topo = "clustered"
+ex_scen = "heavy"
+
+if (ex_ep in cluster_profiles and
+    ex_topo in cluster_profiles[ex_ep] and
+    ex_scen in cluster_profiles[ex_ep][ex_topo]):
+
+    ex_prof = cluster_profiles[ex_ep][ex_topo][ex_scen]
+    print("K =", ex_prof["K"])
+    print("\nCluster summary (first few cols):")
+    print(ex_prof["cluster_summary"].iloc[:, :10])
+else:
+    print("[warn] Example triple not found in cluster_profiles.")
+
+
+test = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]
+print(test.keys())
+
+print(env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["profiles"]["cluster_summary"])
+
+
+# Heatmap Visualization
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_cluster_profile_heatmap(env_cfg,
+                                 ep_name: str,
+                                 topo_name: str,
+                                 scen_name: str,
+                                 out_root="./artifacts/clustering"):
+    """
+    Draw heatmap of cluster profile means for a given env_cfg.
+
+    Uses:
+        env_cfg["clustering"]["profiles"]["cluster_summary"]
+    """
+
+    # 1) Extract cluster profiles
+    clust = env_cfg.get("clustering", {})
+    profs = clust.get("profiles", None)
+
+    if profs is None or "cluster_summary" not in profs:
+        print(f"[heatmap/skip] No cluster profiles for {ep_name}/{topo_name}/{scen_name}")
+        return None
+
+    cluster_summary = profs["cluster_summary"].copy()
+    K = profs["K"]
+
+    # remove non-feature columns if present
+    drop_cols = ["cluster_id", "n_agents_cluster"]
+    feature_cols = [c for c in cluster_summary.columns if c not in drop_cols]
+
+    df = cluster_summary[feature_cols].copy()
+
+    # 2) Normalize per-column
+    df_norm = (df - df.min()) / (df.max() - df.min() + 1e-9)
+
+    # 3) Output directory
+    out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "cluster_profile_heatmap.png")
+
+    # 4) Plot heatmap
+    plt.figure(figsize=(14, 6))
+    sns.heatmap(
+        df_norm,
+        annot=False,
+        cmap="viridis",
+        xticklabels=df_norm.columns,
+        yticklabels=[f"Cluster {i}" for i in range(K)]
+    )
+
+    plt.title(f"Cluster Profile Heatmap: {ep_name}/{topo_name}/{scen_name}")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    print(f"[heatmap] Saved → {out_path}")
+    return out_path
+
+
+for ep in env_configs:
+    for topo in env_configs[ep]:
+        for scen in env_configs[ep][topo]:
+            plot_cluster_profile_heatmap(
+                env_configs[ep][topo][scen],
+                ep, topo, scen
+            )
+            
+
+
+
+
+# Step 5: MDP Environment
+

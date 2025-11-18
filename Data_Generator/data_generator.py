@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 """
 Data generator for Edge–MEC–Cloud with Poisson arrivals (per-second),
 lognormal task features (parameterized by median & sigma_g), and policy-agnostic outputs.
