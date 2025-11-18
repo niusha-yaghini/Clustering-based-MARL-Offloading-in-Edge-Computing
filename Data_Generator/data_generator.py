@@ -1,28 +1,41 @@
 # -*- coding: utf-8 -*-
-
 """
 Data generator for Edge–MEC–Cloud with Poisson arrivals (per-second),
 lognormal task features (parameterized by median & sigma_g), and policy-agnostic outputs.
 
-Now supports THREE SCENARIOS (light / moderate / heavy) similar to HOODIE experiments.
-For each scenario we:
-  - synthesize time-stamped arrivals and task features for one or more episodes
-  - save CSV + a dataset_meta.json
-  - plot distribution figures (PNG) for key variables
-  - export a summary_stats.csv with quantiles/means
+HOODIE-style timing:
+  - Each episode has T = 110 time-slots:
+      * T_decision = 100 slots for decision-making (with arrivals)
+      * T_drain    = 10 slots for draining queues (NO new arrivals)
+  - DRL environment can later consume this as event-driven using the time-stamps.
 
-Fixes/Improvements:
-- Per-episode subfolders (avoid overwrite) → ./datasets/<scenario>/ep_XXX/
-- Flexible lognormal quantile with small z-table + clamp
-- Parameter asserts & unit consistency
-- Richer summary (p90/p99, modality dist, tasks/hour)
-- Optional modality probabilities in TaskFeatureDist
-- Dtype optimization for large datasets
+Supports THREE SCENARIOS (light / moderate / heavy) similar to HOODIE experiments.
+For each episode we:
+  - synthesize time-stamped arrivals and task features for ALL scenarios
+  - save CSV + a per-episode dataset_metadata.json
+  - plot distribution figures (PNG) for key variables
+  - export a summary_stats.csv with quantiles/means per scenario
+
+Directory layout (per episode):
+  datasets/
+    ep_000/
+      light/
+        episodes.csv
+        agents.csv
+        arrivals.csv
+        tasks.csv
+        summary_stats.csv
+        *.png
+      moderate/
+        ...
+      heavy/
+        ...
+      dataset_metadata.json   # meta info for ALL scenarios in this episode
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import numpy as np
 import pandas as pd
 import random, math, os, json
@@ -42,8 +55,10 @@ np.random.seed(GLOBAL_SEED)
 # -------------------------
 @dataclass
 class EpisodeConf:
-    Delta: float      # seconds per slot
-    T_slots: int      # number of slots in the episode
+    Delta: float        # seconds per slot
+    T_slots: int        # total number of slots in the episode (e.g. 110)
+    T_decision: int     # number of slots with arrivals (e.g. 100)
+    T_drain: int        # number of drain slots without arrivals (e.g. 10)
     seed: int
 
 @dataclass
@@ -61,13 +76,13 @@ class AgentRanges:
 class TaskFeatureDist:
     # Lognormal parameterization via median and sigma_g (geometric std).
     b_median: float = 3.0          # MB
-    b_sigma_g: float = 0.6
+    b_sigma_g: float = 1.5
 
     rho_median: float = 1.2e9      # cycles / MB
-    rho_sigma_g: float = 0.5
+    rho_sigma_g: float = 1.5
 
     mem_median: float = 64.0       # MB
-    mem_sigma_g: float = 0.5
+    mem_sigma_g: float = 1.5
 
     p_deadline: float = 0.25
     deadline_min: float = 0.3      # seconds (relative)
@@ -94,13 +109,18 @@ class GlobalConfig:
 # -------------------------
 def _validate_cfg(cfg: GlobalConfig) -> None:
     assert cfg.N_agents > 0
-    assert cfg.Episode.Delta > 0 and cfg.Episode.T_slots > 0
+    assert cfg.Episode.Delta > 0
+    assert cfg.Episode.T_slots > 0
+    assert cfg.Episode.T_decision > 0
+    assert cfg.Episode.T_drain >= 0
+    assert cfg.Episode.T_slots == cfg.Episode.T_decision + cfg.Episode.T_drain
+
     ar = cfg.AgentRanges
     assert ar.lam_sec_min >= 0 and ar.lam_sec_max >= ar.lam_sec_min
     td = cfg.TaskDist
     assert td.split_ratio_min > 0 and td.split_ratio_max <= 1.0 and td.split_ratio_max >= td.split_ratio_min
     assert td.deadline_min <= td.deadline_max
-    # geometric std must be >= 1.0 (clamped later, but assert for awareness)
+    # geometric std must be >= 1.0
     assert td.b_sigma_g >= 1.0 and td.rho_sigma_g >= 1.0 and td.mem_sigma_g >= 1.0
 
 # -------------------------
@@ -117,7 +137,8 @@ _Z_TABLE = {
 
 def _z_from_p(p: float) -> float:
     # Use small table + nearest clamp (no SciPy dependency)
-    if p in _Z_TABLE: return _Z_TABLE[p]
+    if p in _Z_TABLE:
+        return _Z_TABLE[p]
     # clamp to nearest key
     return _Z_TABLE[min(_Z_TABLE.keys(), key=lambda k: abs(k - p))]
 
@@ -127,7 +148,12 @@ def lognormal_quantile(median: float, sigma_g: float, p: float) -> float:
     z = _z_from_p(p)
     return median * math.exp(z * math.log(max(sigma_g, 1.0 + 1e-6)))
 
-def lognormal_from_median_sigma_g(rng, median: float, sigma_g: float, qcap: float | None = 0.99) -> float:
+def lognormal_from_median_sigma_g(
+    rng: np.random.Generator,
+    median: float,
+    sigma_g: float,
+    qcap: float | None = 0.99
+) -> float:
     """
     Draw from LogNormal with given median and geometric std:
       X ~ LogNormal(mu, sigma) where median = exp(mu), sigma_g = exp(sigma).
@@ -164,7 +190,7 @@ def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
 # task features
 # -------------------------
 def _modality_choice(rng: np.random.Generator, d: TaskFeatureDist) -> str:
-    labels = d.modality_labels or ["image","video","text","sensor"]
+    labels = d.modality_labels or ["image", "video", "text", "sensor"]
     if d.modality_probs is None:
         probs = [0.3, 0.2, 0.3, 0.2]
     else:
@@ -194,25 +220,50 @@ def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: floa
 # -------------------------
 # episode generator (arrivals only)
 # -------------------------
-def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0, qcap: float = 0.99) -> Dict[str, pd.DataFrame]:
+def run_episode(
+    cfg: GlobalConfig,
+    agents: List[Agent],
+    episode_id: int = 0,
+    qcap: float = 0.99
+) -> Dict[str, pd.DataFrame]:
     """
-    Generate time-stamped arrivals and task features for one episode.
+    Generate time-stamped arrivals and task features for ONE episode of ONE scenario.
+
+    HOODIE-style:
+      - t = 0 .. T_decision-1 → arrivals via Poisson
+      - t = T_decision .. T_slots-1 → NO new arrivals (drain phase)
     """
     _validate_cfg(cfg)
     rng_local = np.random.default_rng(cfg.Episode.seed + episode_id)
 
     rows_episodes: List[Dict] = []
-    rows_agents:   List[Dict] = [asdict(a) for a in agents]
+    rows_agents:   List[Dict] = []
     rows_arrivals: List[Dict] = []
     rows_tasks:    List[Dict] = []
 
-    Delta   = cfg.Episode.Delta
-    T_slots = cfg.Episode.T_slots
+    Delta      = cfg.Episode.Delta
+    T_slots    = cfg.Episode.T_slots
+    T_decision = cfg.Episode.T_decision
+
+    # agents (include scenario for easier joins)
+    for a in agents:
+        rows_agents.append({
+            "scenario": cfg.name,
+            "agent_id": a.agent_id,
+            "f_local": a.f_local,
+            "m_local": a.m_local,
+            "lam_sec": a.lam_sec
+        })
 
     task_id_counter = 0
 
     for t in range(T_slots):
         t_time = t * Delta
+
+        # Only first T_decision slots have new arrivals (HOODIE style)
+        if t >= T_decision:
+            continue
+
         for a in agents:
             # per-slot rate from per-second rate:
             lam_slot = a.lam_sec * Delta
@@ -266,6 +317,8 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0, qca
         "episode_id": episode_id,
         "Delta": Delta,
         "T_slots": T_slots,
+        "T_decision": T_decision,
+        "T_drain": cfg.Episode.T_drain,
         "hours": T_slots * Delta / 3600.0,
         "N_agents": len(agents),
         "seed": cfg.Episode.seed + episode_id
@@ -276,21 +329,22 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0, qca
     arrivals_df = pd.DataFrame(rows_arrivals)
     tasks_df    = pd.DataFrame(rows_tasks)
 
-    # Optimize dtypes (optional but useful)
+    # Optimize dtypes
     if len(tasks_df):
         tasks_df["modality"] = tasks_df["modality"].astype("category")
         tasks_df["action_space_hint"] = tasks_df["action_space_hint"].astype("category")
         # ints
-        for col in ["episode_id","task_id","agent_id","t_arrival_slot","has_deadline","non_atomic"]:
+        for col in ["episode_id", "task_id", "agent_id", "t_arrival_slot", "has_deadline", "non_atomic"]:
             if col in tasks_df:
                 tasks_df[col] = tasks_df[col].astype("int32")
         # floats
-        for col in ["t_arrival_time","b_mb","rho_cyc_per_mb","c_cycles","mem_mb","deadline_s","deadline_time","split_ratio"]:
+        for col in ["t_arrival_time", "b_mb", "rho_cyc_per_mb", "c_cycles", "mem_mb",
+                    "deadline_s", "deadline_time", "split_ratio"]:
             if col in tasks_df:
                 tasks_df[col] = tasks_df[col].astype("float32")
 
     if len(arrivals_df):
-        for col in ["episode_id","t_slot","agent_id","task_id"]:
+        for col in ["episode_id", "t_slot", "agent_id", "task_id"]:
             if col in arrivals_df:
                 arrivals_df[col] = arrivals_df[col].astype("int32")
         for col in ["t_time"]:
@@ -300,8 +354,16 @@ def run_episode(cfg: GlobalConfig, agents: List[Agent], episode_id: int = 0, qca
     if len(agents_df):
         for col in ["agent_id"]:
             agents_df[col] = agents_df[col].astype("int32")
-        for col in ["f_local","m_local","lam_sec"]:
+        for col in ["f_local", "m_local", "lam_sec"]:
             agents_df[col] = agents_df[col].astype("float64")
+
+    if len(episodes_df):
+        for col in ["episode_id", "N_agents", "T_slots", "T_decision", "T_drain"]:
+            if col in episodes_df:
+                episodes_df[col] = episodes_df[col].astype("int32")
+        for col in ["Delta", "hours"]:
+            if col in episodes_df:
+                episodes_df[col] = episodes_df[col].astype("float32")
 
     return {
         "episodes": episodes_df,
@@ -331,33 +393,29 @@ def _config_fingerprint(cfg: GlobalConfig) -> str:
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
 
-def save_meta(cfg: GlobalConfig, out_dir: str = ".", qcap: float = 0.99) -> str:
+def save_episode_meta(
+    cfgs: List[GlobalConfig],
+    ep_dir: str,
+    qcap: float = 0.99
+) -> str:
+    """
+    Save a single dataset_metadata.json inside ep_xxx containing
+    config info for ALL scenarios used in this episode.
+    """
     meta = {
         "schema_version": "1.0.0",
-        "scenario": cfg.name,
-        "seed": cfg.Episode.seed,
-        "fingerprint": _config_fingerprint(cfg),
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "env": {"python": platform.python_version(), "user": getpass.getuser()},
-        "Episode": asdict(cfg.Episode),
-        "N_agents": cfg.N_agents,
-        "AgentRanges": asdict(cfg.AgentRanges),
-        "TaskDist": asdict(cfg.TaskDist),
-        "units": {
-            "Delta": "seconds",
-            "lam_sec": "tasks per second (per agent)",
-            "per_slot_rate": "lam_sec * Delta",
-            "b_mb": "MB",
-            "rho_cyc_per_mb": "CPU cycles per MB",
-            "c_cycles": "CPU cycles",
-            "mem_mb": "MB",
-            "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
-            "f_local": "Hz",
-            "m_local": "MB"
+        "env": {
+            "python": platform.python_version(),
+            "user": getpass.getuser()
         },
+        "episodes_root": os.path.abspath(ep_dir),
         "notes": {
             "policy_agnostic": True,
             "queueing": "not simulated here",
+            "timing": {
+                "description": "HOODIE-style: T_decision slots with arrivals + T_drain slots without arrivals.",
+            },
             "clipping": {
                 "enabled": True,
                 "method": "lognormal analytic quantile cap",
@@ -365,9 +423,33 @@ def save_meta(cfg: GlobalConfig, out_dir: str = ".", qcap: float = 0.99) -> str:
                 "z_table_keys": sorted(list(_Z_TABLE.keys()))
             },
             "action_space_hint": "derived from non_atomic; final decision belongs to environment"
-        }
+        },
+        "scenarios": []
     }
-    path = os.path.join(out_dir, f"dataset_meta.json")
+
+    for cfg in cfgs:
+        meta["scenarios"].append({
+            "name": cfg.name,
+            "fingerprint": _config_fingerprint(cfg),
+            "Episode": asdict(cfg.Episode),
+            "N_agents": cfg.N_agents,
+            "AgentRanges": asdict(cfg.AgentRanges),
+            "TaskDist": asdict(cfg.TaskDist),
+            "units": {
+                "Delta": "seconds",
+                "lam_sec": "tasks per second (per agent)",
+                "per_slot_rate": "lam_sec * Delta",
+                "b_mb": "MB",
+                "rho_cyc_per_mb": "CPU cycles per MB",
+                "c_cycles": "CPU cycles",
+                "mem_mb": "MB",
+                "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
+                "f_local": "Hz",
+                "m_local": "MB"
+            }
+        })
+
+    path = os.path.join(ep_dir, "dataset_metadata.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return path
@@ -380,34 +462,38 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
 
     # ---- summary stats
     def q(series: pd.Series, p: float):
-        return float(np.nanquantile(series.dropna(), p)) if len(series.dropna()) else float("nan")
+        s = series.dropna()
+        return float(np.nanquantile(s, p)) if len(s) else float("nan")
 
     tasks_per_hour = float(len(tasks)) / float(episodes.iloc[0]["hours"]) if len(episodes) and episodes.iloc[0]["hours"] > 0 else float("nan")
 
     # modality distribution
-    mod_counts = tasks["modality"].value_counts(dropna=False) if len(tasks) else pd.Series(dtype=int)
-    mod_dist = {str(k): int(v) for k, v in mod_counts.to_dict().items()}
+    if len(tasks):
+        mod_counts = tasks["modality"].value_counts(dropna=False)
+        mod_dist = {str(k): int(v) for k, v in mod_counts.to_dict().items()}
+    else:
+        mod_dist = {}
 
     summary = {
         "n_tasks": [len(tasks)],
         "n_arrivals": [len(arrivals)],
         "tasks_per_hour": [tasks_per_hour],
-        "b_mb_median": [q(tasks["b_mb"], 0.5)],
-        "b_mb_p90": [q(tasks["b_mb"], 0.9)],
-        "b_mb_p99": [q(tasks["b_mb"], 0.99)],
-        "rho_median": [q(tasks["rho_cyc_per_mb"], 0.5)],
-        "rho_p90": [q(tasks["rho_cyc_per_mb"], 0.9)],
-        "c_cycles_median": [q(tasks["c_cycles"], 0.5)],
-        "c_cycles_p90": [q(tasks["c_cycles"], 0.9)],
-        "c_cycles_p99": [q(tasks["c_cycles"], 0.99)],
-        "deadline_share": [float((tasks["has_deadline"]==1).mean()) if len(tasks) else float("nan")],
-        "non_atomic_share": [float((tasks["non_atomic"]==1).mean()) if len(tasks) else float("nan")],
+        "b_mb_median": [q(tasks["b_mb"], 0.5)] if len(tasks) else [float("nan")],
+        "b_mb_p90": [q(tasks["b_mb"], 0.9)] if len(tasks) else [float("nan")],
+        "b_mb_p99": [q(tasks["b_mb"], 0.99)] if len(tasks) else [float("nan")],
+        "rho_median": [q(tasks["rho_cyc_per_mb"], 0.5)] if len(tasks) else [float("nan")],
+        "rho_p90": [q(tasks["rho_cyc_per_mb"], 0.9)] if len(tasks) else [float("nan")],
+        "c_cycles_median": [q(tasks["c_cycles"], 0.5)] if len(tasks) else [float("nan")],
+        "c_cycles_p90": [q(tasks["c_cycles"], 0.9)] if len(tasks) else [float("nan")],
+        "c_cycles_p99": [q(tasks["c_cycles"], 0.99)] if len(tasks) else [float("nan")],
+        "deadline_share": [float((tasks["has_deadline"] == 1).mean()) if len(tasks) else float("nan")],
+        "non_atomic_share": [float((tasks["non_atomic"] == 1).mean()) if len(tasks) else float("nan")],
         "modality_counts_json": [json.dumps(mod_dist)]
     }
-    pd.DataFrame(summary).to_csv(os.path.join(out_dir, f"summary_stats.csv"), index=False)
+    pd.DataFrame(summary).to_csv(os.path.join(out_dir, "summary_stats.csv"), index=False)
 
     # ---- plots (each in its own figure)
-    def hist_plot(series: pd.Series, title: str, fname: str, logx: bool=False):
+    def hist_plot(series: pd.Series, title: str, fname: str, logx: bool = False):
         plt.figure()
         s = series.dropna()
         if len(s) == 0:
@@ -415,7 +501,7 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         else:
             plt.hist(s, bins=50)
             if logx:
-                plt.xscale('log')
+                plt.xscale("log")
             plt.title(title)
             plt.xlabel(title)
             plt.ylabel("count")
@@ -423,11 +509,13 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         plt.savefig(os.path.join(out_dir, fname), dpi=160)
         plt.close()
 
-    hist_plot(tasks["b_mb"],            title="Task size (MB)",                fname=f"hist_b_mb.png", logx=True)
-    hist_plot(tasks["rho_cyc_per_mb"],  title="Compute density (cycles/MB)",   fname=f"hist_rho.png",  logx=True)
-    hist_plot(tasks["c_cycles"],        title="Total cycles",                  fname=f"hist_c_cycles.png", logx=True)
-    hist_plot(tasks["deadline_s"],      title="Deadline (s)",                  fname=f"hist_deadline_s.png", logx=False)
-    hist_plot(tasks.loc[tasks["non_atomic"]==1, "split_ratio"], title="Split ratio (only non-atomic)", fname=f"hist_split_ratio.png", logx=False)
+    if len(tasks):
+        hist_plot(tasks["b_mb"],            title="Task size (MB)",                fname="hist_b_mb.png", logx=True)
+        hist_plot(tasks["rho_cyc_per_mb"],  title="Compute density (cycles/MB)",   fname="hist_rho.png",  logx=True)
+        hist_plot(tasks["c_cycles"],        title="Total cycles",                  fname="hist_c_cycles.png", logx=True)
+        hist_plot(tasks["deadline_s"],      title="Deadline (s)",                  fname="hist_deadline_s.png", logx=False)
+        hist_plot(tasks.loc[tasks["non_atomic"] == 1, "split_ratio"],
+                  title="Split ratio (only non-atomic)", fname="hist_split_ratio.png", logx=False)
 
     # arrivals per agent
     if len(arrivals):
@@ -438,21 +526,29 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         plt.xlabel("agent_id")
         plt.ylabel("count")
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"bar_arrivals_per_agent.png"), dpi=160)
+        plt.savefig(os.path.join(out_dir, "bar_arrivals_per_agent.png"), dpi=160)
         plt.close()
 
 # -------------------------
-# scenario presets (light / moderate / heavy)
+# scenario presets (light / moderate / heavy) – HOODIE-style timing
 # -------------------------
-HOURS = 1
-DEFAULT_DELTA = 1.0
-DEFAULT_T_SLOTS = int(HOURS * 3600 / DEFAULT_DELTA)
+DEFAULT_DELTA = 1.0      # 1 second per slot (unit choice)
+T_DECISION = 100         # 100 decision slots
+T_DRAIN    = 10          # 10 drain slots
+DEFAULT_T_SLOTS = T_DECISION + T_DRAIN  # 110 total
 
-BASE_EPISODE = EpisodeConf(Delta=DEFAULT_DELTA, T_slots=DEFAULT_T_SLOTS, seed=GLOBAL_SEED)
+BASE_EPISODE = EpisodeConf(
+    Delta=DEFAULT_DELTA,
+    T_slots=DEFAULT_T_SLOTS,
+    T_decision=T_DECISION,
+    T_drain=T_DRAIN,
+    seed=GLOBAL_SEED
+)
+
 BASE_AGENT_RANGES = AgentRanges(
     lam_sec_min=0.02, lam_sec_max=0.80,
     f_local_min=0.8e9, f_local_max=2.4e9,
-    m_local_min=3e3,  m_local_max=8e3 # MB
+    m_local_min=3e3,  m_local_max=8e3  # MB
 )
 BASE_TASK_DIST = TaskFeatureDist()
 
@@ -462,73 +558,258 @@ SCENARIOS: List[GlobalConfig] = [
         N_agents=18,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 101),
         AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.01, lam_sec_max=0.05),
-        TaskDist=replace(BASE_TASK_DIST,
+        TaskDist=replace(
+            BASE_TASK_DIST,
             b_median=2.0,  b_sigma_g=1.55,
             rho_median=1.0e9, rho_sigma_g=1.45,
             mem_median=64.0, mem_sigma_g=1.40,
             p_deadline=0.15, deadline_min=0.8, deadline_max=2.0,
-            p_non_atomic=0.25, split_ratio_min=0.25, split_ratio_max=0.75)
+            p_non_atomic=0.25, split_ratio_min=0.25, split_ratio_max=0.75
+        )
     ),
     GlobalConfig(
         name="moderate",
         N_agents=18,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 202),
         AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.05, lam_sec_max=0.20),
-        TaskDist=replace(BASE_TASK_DIST,
+        TaskDist=replace(
+            BASE_TASK_DIST,
             b_median=3.0,  b_sigma_g=1.60,
             rho_median=1.2e9, rho_sigma_g=1.50,
             mem_median=64.0, mem_sigma_g=1.45,
             p_deadline=0.25, deadline_min=0.5, deadline_max=1.5,
-            p_non_atomic=0.35, split_ratio_min=0.30, split_ratio_max=0.80)
+            p_non_atomic=0.35, split_ratio_min=0.30, split_ratio_max=0.80
+        )
     ),
     GlobalConfig(
         name="heavy",
         N_agents=18,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 303),
         AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.20, lam_sec_max=0.80),
-        TaskDist=replace(BASE_TASK_DIST,
+        TaskDist=replace(
+            BASE_TASK_DIST,
             b_median=5.0,  b_sigma_g=1.70,
             rho_median=1.5e9, rho_sigma_g=1.55,
             mem_median=64.0, mem_sigma_g=1.50,
             p_deadline=0.35, deadline_min=0.3, deadline_max=1.0,
-            p_non_atomic=0.45, split_ratio_min=0.40, split_ratio_max=0.85)
+            p_non_atomic=0.45, split_ratio_min=0.40, split_ratio_max=0.85
+        )
     )
 ]
 
-
 # -------------------------
-# main driver
+# drivers: per-scenario & all-scenarios
 # -------------------------
-def main_generate(cfg: GlobalConfig, episodes: int = 1, out_root: str = "./datasets", qcap: float = 0.99) -> Dict[str, str]:
-    """Generate 'episodes' episodes for one scenario (fixed agent pool per scenario)."""
+def main_generate_for_scenario(
+    cfg: GlobalConfig,
+    agents: List[Agent],
+    episode_id: int,
+    ep_dir: str,
+    qcap: float = 0.99
+) -> Dict[str, str]:
+    """
+    Generate ONE episode for ONE scenario under:
+        ep_dir/<scenario>/
+    For example: datasets/ep_000/heavy/
+    """
     _validate_cfg(cfg)
-    out_dir = os.path.join(out_root, cfg.name)
-    os.makedirs(out_dir, exist_ok=True)
 
-    # build agents once per scenario to keep them consistent across its episodes
-    rng_agents = np.random.default_rng(cfg.Episode.seed + 10_000)
-    agents = build_agents(cfg, rng_agents)
+    scenario_dir = os.path.join(ep_dir, cfg.name)
+    os.makedirs(scenario_dir, exist_ok=True)
 
-    all_paths: Dict[str, str] = {}
-    for ep in range(episodes):
-        ep_dir = os.path.join(out_dir, f"ep_{ep:03d}")
+    dfs = run_episode(cfg, agents, episode_id=episode_id, qcap=qcap)
+    paths = save_dataset(dfs, out_dir=scenario_dir)
+    summarize_and_plot(dfs, out_dir=scenario_dir)
+
+    return paths
+
+def generate_all_scenarios(
+    episodes_each: int = 1,
+    out_root: str = "./datasets",
+    qcap: float = 0.99
+) -> Dict[str, Dict[str, str]]:
+    """
+    Layout:
+        out_root/ep_000/<scenario>/
+        out_root/ep_001/<scenario>/
+        ...
+    And inside each ep_xxx we store dataset_metadata.json
+    with info for ALL scenarios.
+
+    NOTE:
+      - To fully mimic HOODIE training (5000 episodes), call:
+            generate_all_scenarios(episodes_each=5000, ...)
+      - Default episodes_each=1 is for debugging.
+    """
+    results: Dict[str, Dict[str, str]] = {}
+
+    # For stability, build agents per scenario once (same pool across episodes for that scenario)
+    agents_per_scenario: Dict[str, List[Agent]] = {}
+    for cfg in SCENARIOS:
+        rng_agents = np.random.default_rng(cfg.Episode.seed + 10_000)
+        agents_per_scenario[cfg.name] = build_agents(cfg, rng_agents)
+
+    for ep in range(episodes_each):
+        ep_name = f"ep_{ep:03d}"
+        ep_dir = os.path.join(out_root, ep_name)
         os.makedirs(ep_dir, exist_ok=True)
 
-        dfs = run_episode(cfg, agents, episode_id=ep, qcap=qcap)
-        paths = save_dataset(dfs, out_dir=ep_dir)
-        summarize_and_plot(dfs, out_dir=ep_dir)
-        all_paths.update({f"ep{ep}_{k}": v for k, v in paths.items()})
+        episode_paths: Dict[str, str] = {}
+        for cfg in SCENARIOS:
+            agents = agents_per_scenario[cfg.name]
+            paths = main_generate_for_scenario(
+                cfg=cfg,
+                agents=agents,
+                episode_id=ep,
+                ep_dir=ep_dir,
+                qcap=qcap
+            )
+            # keys like: heavy_episodes_csv, heavy_tasks_csv, ...
+            for k, v in paths.items():
+                episode_paths[f"{cfg.name}_{k}"] = v
 
-    meta_path = save_meta(cfg, out_dir=out_dir, qcap=qcap)
-    all_paths["meta"] = meta_path
-    return all_paths
+        # per-episode metadata (ALL scenarios)
+        meta_path = save_episode_meta(SCENARIOS, ep_dir=ep_dir, qcap=qcap)
+        episode_paths["metadata_json"] = meta_path
 
-def generate_all_scenarios(episodes_each: int = 1, out_root: str = "./datasets", qcap: float = 0.99) -> Dict[str, Dict[str, str]]:
-    results: Dict[str, Dict[str, str]] = {}
-    for cfg in SCENARIOS:
-        results[cfg.name] = main_generate(cfg, episodes=episodes_each, out_root=out_root, qcap=qcap)
+        results[ep_name] = episode_paths
+
     return results
 
+# -------------------------
+# sanity checks
+# -------------------------
+def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
+    """
+    Lightweight sanity checks for one ep_xxx:
+      - basic file presence
+      - tasks vs arrivals count & task_id consistency
+      - agent_id consistency
+      - basic value ranges (positivity, deadlines, split_ratio)
+      - rough consistency between lambda and realized tasks/hour (on decision slots)
+    """
+    print(f"[sanity] Checking episode directory: {ep_dir}")
+    meta_path = os.path.join(ep_dir, "dataset_metadata.json")
+    if not os.path.isfile(meta_path):
+        print(f"  [WARN] No dataset_metadata.json found in {ep_dir}")
+    else:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            print(f"  [OK] Loaded metadata with {len(meta.get('scenarios', []))} scenarios")
+        except Exception as e:
+            print(f"  [WARN] Failed to read metadata: {e}")
+
+    for scen in scenario_names:
+        scen_dir = os.path.join(ep_dir, scen)
+        if not os.path.isdir(scen_dir):
+            print(f"  [WARN] Scenario dir missing: {scen_dir}")
+            continue
+
+        try:
+            episodes_df = pd.read_csv(os.path.join(scen_dir, "episodes.csv"))
+            agents_df   = pd.read_csv(os.path.join(scen_dir, "agents.csv"))
+            arrivals_df = pd.read_csv(os.path.join(scen_dir, "arrivals.csv"))
+            tasks_df    = pd.read_csv(os.path.join(scen_dir, "tasks.csv"))
+        except Exception as e:
+            print(f"  [WARN] Failed to load CSVs for scenario '{scen}': {e}")
+            continue
+
+        print(f"  [scenario={scen}] n_tasks={len(tasks_df)}, n_arrivals={len(arrivals_df)}, n_agents={len(agents_df)}")
+
+        # 1) non-empty checks
+        if len(tasks_df) == 0 or len(arrivals_df) == 0:
+            print(f"    [WARN] Empty tasks or arrivals for scenario '{scen}'")
+            continue
+
+        # 2) tasks vs arrivals counts & unique task_ids
+        if len(tasks_df) != len(arrivals_df):
+            print(f"    [WARN] tasks ({len(tasks_df)}) != arrivals ({len(arrivals_df)})")
+
+        if tasks_df["task_id"].nunique() != len(tasks_df):
+            print(f"    [WARN] Duplicate task_id in tasks.csv for scenario '{scen}'")
+
+        # 3) agent_id consistency
+        agents_set = set(agents_df["agent_id"].tolist())
+        arr_agents = set(arrivals_df["agent_id"].tolist())
+        task_agents = set(tasks_df["agent_id"].tolist())
+        if not arr_agents.issubset(agents_set):
+            print(f"    [WARN] Some arrival agent_ids not in agents table for '{scen}'")
+        if not task_agents.issubset(agents_set):
+            print(f"    [WARN] Some task agent_ids not in agents table for '{scen}'")
+
+        # 4) basic value ranges
+        if (tasks_df["b_mb"] <= 0).any():
+            print(f"    [WARN] Non-positive b_mb values in tasks for '{scen}'")
+        if (tasks_df["mem_mb"] <= 0).any():
+            print(f"    [WARN] Non-positive mem_mb values in tasks for '{scen}'")
+        if (tasks_df["c_cycles"] <= 0).any():
+            print(f"    [WARN] Non-positive c_cycles values in tasks for '{scen}'")
+
+        # deadlines: deadline_time >= t_arrival_time when has_deadline
+        with_deadline = tasks_df["has_deadline"] == 1
+        if with_deadline.any():
+            bad_deadlines = (tasks_df.loc[with_deadline, "deadline_time"] <
+                             tasks_df.loc[with_deadline, "t_arrival_time"]).sum()
+            if bad_deadlines > 0:
+                print(f"    [WARN] {bad_deadlines} rows with deadline_time < t_arrival_time in '{scen}'")
+
+        # split ratio range
+        if ((tasks_df["split_ratio"] < 0) | (tasks_df["split_ratio"] > 1)).any():
+            print(f"    [WARN] split_ratio out of [0,1] range in '{scen}'")
+        # non_atomic=0 => split_ratio==0
+        non_atomic_zero = tasks_df["non_atomic"] == 0
+        if (tasks_df.loc[non_atomic_zero, "split_ratio"] != 0).any():
+            print(f"    [WARN] non_atomic==0 but split_ratio != 0 in '{scen}'")
+
+        # 5) rough lambda consistency check (using decision horizon length)
+        if len(episodes_df):
+            hours = float(episodes_df.iloc[0]["T_decision"] * episodes_df.iloc[0]["Delta"]) / 3600.0
+            if hours > 0:
+                # arrivals only exist in decision slots by construction
+                tasks_per_agent = arrivals_df.groupby("agent_id").size() / hours
+                merged = pd.merge(
+                    agents_df[["agent_id", "lam_sec"]],
+                    tasks_per_agent.rename("tasks_per_hour").reset_index(),
+                    on="agent_id",
+                    how="left"
+                )
+                merged["lam_per_hour"] = merged["lam_sec"] * 3600.0
+                merged["ratio"] = merged["tasks_per_hour"] / merged["lam_per_hour"]
+                too_low = (merged["ratio"] < 0.4).sum()
+                too_high = (merged["ratio"] > 1.6).sum()
+                if too_low + too_high > 0:
+                    print(f"    [INFO] Poisson check: some agents have realized rate far from expected "
+                          f"(too_low={too_low}, too_high={too_high}) in '{scen}'")
+
+def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
+    """
+    Run sanity checks over all ep_* folders under out_root.
+    """
+    if not os.path.isdir(out_root):
+        print(f"[sanity] Root directory '{out_root}' does not exist.")
+        return
+
+    episodes = sorted([d for d in os.listdir(out_root) if d.startswith("ep_")])
+    if not episodes:
+        print(f"[sanity] No ep_* folders found under '{out_root}'.")
+        return
+
+    for ep_name in episodes:
+        ep_dir = os.path.join(out_root, ep_name)
+        if os.path.isdir(ep_dir):
+            sanity_check_episode(ep_dir, scenario_names)
+
+# -------------------------
+# main
+# -------------------------
 if __name__ == "__main__":
-    out = generate_all_scenarios(episodes_each=1, out_root="./datasets")
-    print(json.dumps(out, indent=2))
+    out_root = "./datasets"
+    # For testing: 1 episode; to get closer to the original HOODIE:
+    #   generate_all_scenarios(episodes_each=5000, ...)
+    results = generate_all_scenarios(episodes_each=1, out_root=out_root, qcap=0.99)
+    print(json.dumps(results, indent=2))
+
+    # basic sanity checks
+    scenario_names = [cfg.name for cfg in SCENARIOS]
+    sanity_check_root(out_root, scenario_names=scenario_names)

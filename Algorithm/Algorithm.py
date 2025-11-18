@@ -4,10 +4,19 @@ import json
 import os
 import math
 import matplotlib.pyplot as plt
-from typing import Dict, Any, Tuple
+from copy import deepcopy
+from typing import List, Dict, Any, Tuple, Optional
 
-from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+import seaborn as sns
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import (
+    silhouette_score,
+    davies_bouldin_score,
+    calinski_harabasz_score,
+)
 
 
 # Step 1: Prepare data and configure the environment
@@ -25,72 +34,114 @@ datasets = {}
 
 def load_datasets_from_directory(dataset_dir, verbose=True):
     """
-    Build 'episode-first' structure:
-    datasets = {
-        "ep_000": {
-            "light":   { "episodes": df, "agents": df, "arrivals": df, "tasks": df },
-            "moderate":{ ... },
-            "heavy":   { ... }
-        },
-        "ep_001": { ... },
-        ...
-    }
+    Episode-first loader for structure:
+
+        dataset_dir/
+          ep_000/
+            light/
+              episodes.csv
+              agents.csv
+              arrivals.csv
+              tasks.csv
+            moderate/
+              ...
+            heavy/
+              ...
+            dataset_metadata.json   (optional, per-episode meta)
+
+    Result:
+        datasets = {
+            "ep_000": {
+                "light":   {"episodes": df, "agents": df, "arrivals": df, "tasks": df},
+                "moderate":{"..."},
+                "heavy":   {"..."},
+                "_meta":   {...}  # if dataset_metadata.json exists
+            },
+            "ep_001": { ... },
+            ...
+        }
     """
-    # Step 1 — detect scenarios (light/moderate/heavy/...)
-    scenarios = [
+    global datasets
+    datasets = {}
+
+    if not os.path.isdir(dataset_dir):
+        raise ValueError(f"dataset_dir does not exist or is not a directory: {dataset_dir}")
+
+    # Step 1 — detect ep_* directories
+    ep_dirs = sorted([
         name for name in os.listdir(dataset_dir)
-        if os.path.isdir(os.path.join(dataset_dir, name))
-    ]
+        if os.path.isdir(os.path.join(dataset_dir, name)) and name.startswith("ep_")
+    ])
 
-    # Step 2 — load per scenario and per episode (ep_XXX)
-    scenario_to_episodes = {}
-    for scenario in scenarios:
-        scn_path = os.path.join(dataset_dir, scenario)
-        ep_dirs = sorted([
-            ep for ep in os.listdir(scn_path)
-            if os.path.isdir(os.path.join(scn_path, ep)) and ep.startswith("ep_")
+    if verbose:
+        if not ep_dirs:
+            print(f"[warn] no ep_* folders found under root '{dataset_dir}'")
+        else:
+            print(f"[info] detected episodes: {ep_dirs}")
+
+    # Step 2 — per episode, detect scenarios and load CSVs
+    for ep_name in ep_dirs:
+        ep_path = os.path.join(dataset_dir, ep_name)
+        datasets[ep_name] = {}
+
+        # scenarios inside this episode (e.g. light/moderate/heavy)
+        scenario_names = sorted([
+            name for name in os.listdir(ep_path)
+            if os.path.isdir(os.path.join(ep_path, name))
         ])
-        if not ep_dirs and verbose:
-            print(f"[warn] no ep_* folders found under scenario '{scenario}'")
 
-        scenario_to_episodes[scenario] = {}
-        for ep_name in ep_dirs:
-            ep_path = os.path.join(scn_path, ep_name)
+        if verbose:
+            if not scenario_names:
+                print(f"[warn] no scenario folders found under episode '{ep_name}'")
+            else:
+                print(f"[info] {ep_name}: scenarios detected -> {scenario_names}")
+
+        for scenario in scenario_names:
+            scn_path = os.path.join(ep_path, scenario)
             try:
-                scenario_to_episodes[scenario][ep_name] = {
-                    "episodes": pd.read_csv(os.path.join(ep_path, "episodes.csv")),
-                    "agents":   pd.read_csv(os.path.join(ep_path, "agents.csv")),
-                    "arrivals": pd.read_csv(os.path.join(ep_path, "arrivals.csv")),
-                    "tasks":    pd.read_csv(os.path.join(ep_path, "tasks.csv")),
+                dfs = {
+                    "episodes": pd.read_csv(os.path.join(scn_path, "episodes.csv")),
+                    "agents":   pd.read_csv(os.path.join(scn_path, "agents.csv")),
+                    "arrivals": pd.read_csv(os.path.join(scn_path, "arrivals.csv")),
+                    "tasks":    pd.read_csv(os.path.join(scn_path, "tasks.csv")),
                 }
+                datasets[ep_name][scenario] = dfs
             except FileNotFoundError as e:
                 if verbose:
-                    print(f"[error] missing CSV in {ep_path}: {e}")
+                    print(f"[error] missing CSV in {scn_path}: {e}")
                 continue
 
-    # Step 3 — invert structure: episodes → scenarios
-    datasets.clear()
-    for scenario, eps in scenario_to_episodes.items():
-        for ep_name, dfs in eps.items():
-            if ep_name not in datasets:
-                datasets[ep_name] = {}
-            datasets[ep_name][scenario] = dfs
+        # Step 3 — load per-episode metadata if present
+        meta_path = os.path.join(ep_path, "dataset_metadata.json")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                datasets[ep_name]["_meta"] = meta
+                if verbose:
+                    print(f"[info] loaded metadata for {ep_name} from {meta_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"[warn] could not load metadata for {ep_name}: {e}")
 
     # Optional summary printing
     if verbose:
-        print("=== Dataset Summary (episode-first) ===")
-        print(f"episodes: {len(datasets)}  | scenarios detected: {len(scenarios)} -> {sorted(scenarios)}")
+        print("\n=== Dataset Summary (episode-first) ===")
+        print(f"episodes detected: {len(datasets)}")
         for ep_name in sorted(datasets.keys()):
-            scenarios_here = sorted(datasets[ep_name].keys())
+            keys_here = sorted(datasets[ep_name].keys())
+            scenarios_here = [k for k in keys_here if not k.startswith("_")]
             print(f"  - {ep_name}: scenarios = {scenarios_here}")
             for scn in scenarios_here:
                 dfs = datasets[ep_name][scn]
-                n_ep   = len(dfs['episodes'])
-                n_ag   = len(dfs['agents'])
-                n_arr  = len(dfs['arrivals'])
-                n_task = len(dfs['tasks'])
+                n_ep   = len(dfs["episodes"])
+                n_ag   = len(dfs["agents"])
+                n_arr  = len(dfs["arrivals"])
+                n_task = len(dfs["tasks"])
                 print(f"      {scn:9s} → episodes:{n_ep:3d}  agents:{n_ag:4d}  arrivals:{n_arr:6d}  tasks:{n_task:6d}")
-        print("=======================================")
+            if "_meta" in datasets[ep_name]:
+                print(f"      meta: dataset_metadata.json loaded")
+        print("=======================================\n")
 
     return datasets
 
@@ -99,28 +150,32 @@ def load_datasets_from_directory(dataset_dir, verbose=True):
 datasets = load_datasets_from_directory(dataset_dir, verbose=True)
 
 # ---- choose an episode and a scenario for printing ----
-# pick first available episode if you don't want to hardcode
 ep_name = sorted(datasets.keys())[0] if datasets else None
-scenario = "heavy"  # you can change to "light"/"moderate" if needed
+scenario = "heavy"  # "light"/"moderate"
 
 if ep_name is not None and scenario in datasets[ep_name]:
     print(f"\n[info] printing from episode='{ep_name}', scenario='{scenario}'")
 
     print("\nagents:")
-    print(datasets[ep_name][scenario]['agents'].head())
-    datasets[ep_name][scenario]['agents'].info()
+    print(datasets[ep_name][scenario]["agents"].head())
+    datasets[ep_name][scenario]["agents"].info()
 
     print("\narrivals:")
-    print(datasets[ep_name][scenario]['arrivals'].head())
-    datasets[ep_name][scenario]['arrivals'].info()
+    print(datasets[ep_name][scenario]["arrivals"].head())
+    datasets[ep_name][scenario]["arrivals"].info()
 
     print("\nepisodes:")
-    print(datasets[ep_name][scenario]['episodes'].head())
-    datasets[ep_name][scenario]['episodes'].info()
+    print(datasets[ep_name][scenario]["episodes"].head())
+    datasets[ep_name][scenario]["episodes"].info()
 
     print("\ntasks:")
-    print(datasets[ep_name][scenario]['tasks'].head())
-    datasets[ep_name][scenario]['tasks'].info()
+    print(datasets[ep_name][scenario]["tasks"].head())
+    datasets[ep_name][scenario]["tasks"].info()
+
+    if "_meta" in datasets[ep_name]:
+        print("\nmeta (dataset_metadata.json):")
+        print(json.dumps(datasets[ep_name]["_meta"], ensure_ascii=False, indent=2))
+
 else:
     print("[error] no datasets found or requested scenario is missing for the chosen episode.")
 
@@ -1805,17 +1860,6 @@ print(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head())
 
 # Step 4: Clustering Agents
 
-# 4.1. Feature Matrix
-
-# To perform clustering, the characteristics of each agent must first be stored in a feature matrix. These characteristics include:
-    # 1) Local resources
-    # 2) task generation pattern
-    
-import numpy as np
-import pandas as pd
-from typing import List, Dict, Any, Tuple, Optional
-from sklearn.preprocessing import StandardScaler
-
 # STEP 4.1 – Agent Feature Matrix Construction
 
 # The feature matrix combines two key components:
@@ -2005,26 +2049,6 @@ print("agent_ids[:10]:", fz["agent_ids"][:10])
 
 # 4.2. Optimal Number of Clusters
 
-# To select the optimal number of clusters (K), we use a hybrid method that 
-    # combines evaluation indices such as WCSS, Silhouette, DBI, and CH Index.
-    
-import os
-import numpy as np
-import pandas as pd
-from typing import Dict, Any, List, Tuple
-
-from sklearn.cluster import KMeans
-from sklearn.metrics import (
-    silhouette_score,
-    davies_bouldin_score,
-    calinski_harabasz_score,
-)
-import matplotlib.pyplot as plt
-
-# ===============================================
-# Step 4.2 — Selecting the number of clusters (K)
-# ===============================================
-#
 # Uses feature matrix from Step 4.1:
 #   env_cfg["clustering"]["features"] = {
 #       "X", "feature_cols", "agent_ids",
@@ -2552,15 +2576,6 @@ for topo in ["clustered", "full_mesh", "sparse_ring"]:
 # After selecting the optimal number of clusters (K_opt), we use the 
     # K-Means algorithm for clustering.
     
-import numpy as np
-import pandas as pd
-from sklearn.cluster import KMeans
-from typing import Dict, Any
-
-# ======================================================
-# Step 4.3 — Final K-Means Clustering Using Selected K
-# ======================================================
-#
 # For each (episode → topology → scenario), we:
 #   1) Fetch best_K from step 4.2
 #   2) Run K-Means (once) using best_K
@@ -2668,12 +2683,6 @@ print("Centers shape:", ex["centers"].shape)
 
 # Visualization — PCA: Display clusters in 2D space
 
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from typing import Dict, Any
-
 def step4_3_plot_clusters_pca(
     env_configs: Dict[str, Dict[str, Dict[str, Any]]],
     out_root: str = "./artifacts/clustering",
@@ -2747,13 +2756,6 @@ step4_3_plot_clusters_pca(env_configs, verbose=True)
 
 
 # Visualization — spacet-SNE: Display clusters in 2D
-
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-from typing import Dict, Any
-
 
 def step4_3_plot_clusters_tsne(
     env_configs: Dict[str, Dict[str, Dict[str, Any]]],
@@ -3000,12 +3002,6 @@ print(env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["profiles"]["clu
 
 
 # Heatmap Visualization
-
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 def plot_cluster_profile_heatmap(env_cfg,
                                  ep_name: str,
