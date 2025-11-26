@@ -2190,11 +2190,11 @@ AGENT_FEATURES_V1 = [
     "hard_share"        # Share of hard-deadline tasks
 ]
 
-# Utility: Keep only existing columns; others will be filled with zeros
-def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
-    return [c for c in cols if c in df.columns]
+# # Utility: Keep only existing columns; others will be filled with zeros
+# def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+#     return [c for c in cols if c in df.columns]
 
-# Build feature matrix for one environment configuration
+# # Build feature matrix for one environment configuration
 # def make_agent_feature_matrix_for_env(
 #     env_cfg: Dict[str, Any],
 #     feature_list: Optional[List[str]] = None,
@@ -2233,47 +2233,7 @@ def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
 
 #     return X, cols, agent_ids, scaler
 
-# Build feature matrix for one environment configuration
-def make_agent_feature_matrix_for_env(
-    env_cfg: Dict[str, Any],
-    feature_list: Optional[List[str]] = None,
-    standardize: bool = True,
-) -> Tuple[np.ndarray, List[str], np.ndarray]:
-    """
-    Build the feature matrix (X) for all agents in one environment configuration.
-    Each row represents an agent; each column a numerical feature.
-    
-    Returns:
-        X_scaled       : np.ndarray (n_agents × n_features)
-        used_cols      : list of feature names in order
-        agent_ids      : np.ndarray of agent identifiers
-    """
-    if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
-        raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
-
-    prof = env_cfg["agent_profiles"].copy()
-    if "agent_id" not in prof.columns:
-        raise ValueError("agent_profiles must include column 'agent_id'.")
-
-    if feature_list is None:
-        feature_list = AGENT_FEATURES_V1
-
-    # Keep valid features and fill missing ones with zeros
-    cols = _safe_cols(prof, feature_list)
-    X = prof.reindex(columns=cols).fillna(0.0).astype(float).to_numpy()
-    agent_ids = prof["agent_id"].to_numpy(dtype=int)
-
-    # Standardize features (mean=0, std=1) for clustering stability
-    if standardize and X.shape[0] > 0:
-        scaler = StandardScaler()
-        X = scaler.fit_transform(X)  # Nomalize the data
-        # Don't store scaler, we will only store the scaled data
-    else:
-        scaler = None
-
-    return X, cols, agent_ids
-
-# Attach computed features to the environment configuration
+# # Attach computed features to the environment configuration
 # def attach_features_to_env(env_cfg: Dict[str, Any],
 #                            feature_list: Optional[List[str]] = None,
 #                            standardize: bool = True) -> Dict[str, Any]:
@@ -2294,21 +2254,103 @@ def make_agent_feature_matrix_for_env(
 #     }
 #     return env_cfg
 
+# # Apply feature construction to all topology-scenario combinations
+# def attach_features_to_all_envs(
+#     env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+#     feature_list: Optional[List[str]] = None,
+#     standardize: bool = True,
+# ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+#     """
+#     Iterate through all (episode → topology → scenario) combinations
+#     and build the feature matrix for each one.
+#     """
+#     for ep_name, by_topo in env_configs.items():
+#         for topo_name, by_scen in by_topo.items():
+#             for scen_name, env_cfg in by_scen.items():
+#                 env_configs[ep_name][topo_name][scen_name] = attach_features_to_env(
+#                     env_cfg, feature_list, standardize
+#                 )
+#                 fz = env_configs[ep_name][topo_name][scen_name]["clustering"]["features"]
+#                 print(f"[features] {ep_name}/{topo_name}/{scen_name} "
+#                       f"-> X.shape={fz['X'].shape}  (agents={fz['n_agents']}, feats={fz['n_features']})")
+#     return env_configs
+
+# Features that need normalization
+FEATURES_TO_STANDARDIZE = [
+    "f_local_slot",   # Local CPU cycles per slot
+    "m_local",        # Local memory capacity
+    "lambda_mean",    # Mean task arrival rate
+    "lambda_var",     # Variance of task arrival rate
+    "b_mb_med",       # Median input size
+    "rho_med",        # Median compute demand (cycles/MB)
+    "mem_med",        # Median memory demand (MB)
+]
+
+# Utility: Keep only existing columns; others will be filled with zeros
+def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+# Build feature matrix for one environment configuration
+def make_agent_feature_matrix_for_env(
+    env_cfg: Dict[str, Any],
+    feature_list: Optional[List[str]] = None,
+    standardize: bool = False,
+) -> Tuple[np.ndarray, List[str], np.ndarray, Optional[StandardScaler]]:
+    """
+    Build the feature matrix (X) for all agents in one environment configuration.
+    Each row represents an agent; each column a numerical feature.
+    
+    Returns:
+        X_scaled       : np.ndarray (n_agents × n_features)
+        used_cols      : list of feature names in order
+        agent_ids      : np.ndarray of agent identifiers
+        scaler         : fitted StandardScaler object (or None if not standardized)
+    """
+    if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
+        raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
+
+    prof = env_cfg["agent_profiles"].copy()
+    if "agent_id" not in prof.columns:
+        raise ValueError("agent_profiles must include column 'agent_id'.")
+
+    if feature_list is None:
+        feature_list = AGENT_FEATURES_V1
+
+    # Keep valid features and fill missing ones with zeros
+    cols = _safe_cols(prof, feature_list)
+    X = prof.reindex(columns=cols).fillna(0.0).astype(float).to_numpy()
+    agent_ids = prof["agent_id"].to_numpy(dtype=int)
+
+    # Standardize only the required features
+    scaler = None
+    if standardize:
+        # Identify which columns need to be standardized
+        standardize_cols = [col for col in cols if col in FEATURES_TO_STANDARDIZE]
+        if len(standardize_cols) > 0:
+            # Apply scaling only to the columns that need standardization
+            scaler = StandardScaler()
+            X[:, [cols.index(col) for col in standardize_cols]] = scaler.fit_transform(
+                X[:, [cols.index(col) for col in standardize_cols]]
+            )
+
+    return X, cols, agent_ids, scaler
+
+# Attach computed features to the environment configuration
 def attach_features_to_env(env_cfg: Dict[str, Any],
                            feature_list: Optional[List[str]] = None,
                            standardize: bool = True) -> Dict[str, Any]:
     """
     Attach the constructed feature matrix and related metadata
-    to env_cfg["clustering"]["features"].
+    to env_cfg["clustering"]["features"]. 
     """
     X, cols, agent_ids, scaler = make_agent_feature_matrix_for_env(env_cfg, feature_list, standardize)
 
-    # We do not store 'scaler' as it is not JSON serializable
     env_cfg.setdefault("clustering", {})
     env_cfg["clustering"]["features"] = {
         "X": X,                          # Feature matrix (scaled)
         "feature_cols": cols,            # List of column names
         "agent_ids": agent_ids,          # Agent identifiers
+        "scaler": scaler,                # StandardScaler (for later inverse transform)
         "n_agents": int(X.shape[0]),
         "n_features": int(X.shape[1]),
     }
@@ -2334,7 +2376,6 @@ def attach_features_to_all_envs(
                 print(f"[features] {ep_name}/{topo_name}/{scen_name} "
                       f"-> X.shape={fz['X'].shape}  (agents={fz['n_agents']}, feats={fz['n_features']})")
     return env_configs
-
 
 def _assert_no_nan_inf(X: np.ndarray, where: str):
     if not np.isfinite(X).all():
@@ -3219,6 +3260,127 @@ step4_3_plot_clusters_tsne(env_configs, verbose=True)
 
 # Interpretation, Summaries, and Cluster Profiles
 
+# def build_cluster_profiles_for_env(
+#     ep_name: str,
+#     topo_name: str,
+#     scen_name: str,
+#     env_cfg: Dict[str, Any],
+#     out_root: str = "./artifacts/clustering"
+# ):
+#     """
+#     Build cluster representative profiles using:
+#       - labels from Step 4.3 (env_cfg['clustering']['final'])
+#       - scaled centers from Step 4.3
+#       - inverse-transformed centers using scaler from Step 4.1
+#       - agent_profiles from Step 3
+#     """
+
+#     # 1) Extract dependencies
+#     clust = env_cfg.get("clustering", {})
+#     feats = clust.get("features", None)
+#     final = clust.get("final", None)   # This must exist (Step 4.3)
+
+#     if feats is None or "X" not in feats:
+#         raise ValueError(f"[4.4] Missing features for {ep_name}/{topo_name}/{scen_name}")
+
+#     if final is None or "labels" not in final or "centers" not in final:
+#         raise ValueError(
+#             f"[4.4] Missing final KMeans results for {ep_name}/{topo_name}/{scen_name}. "
+#             f"Did you forget to run Step 4.3?"
+#         )
+
+#     best_K         = int(final["K"])
+#     labels         = np.asarray(final["labels"], dtype=int)
+#     centers_scaled = np.asarray(final["centers"], dtype=float)
+
+#     agent_ids    = feats["agent_ids"]
+#     scaler       = feats["scaler"]
+#     feature_cols = feats["feature_cols"]
+
+#     prof = env_cfg["agent_profiles"].copy()
+
+#     # 2) Build assignment table (agent_id → cluster_id)
+#     assign_df = pd.DataFrame({
+#         "agent_id": agent_ids,
+#         "cluster_id": labels
+#     })
+
+#     prof = prof.merge(assign_df, on="agent_id", how="left")
+
+#     # === NEW: Inject cluster_id into tasks DataFrame ===
+#     tasks_df = env_cfg.get("tasks", None)
+#     if tasks_df is not None and "agent_id" in tasks_df.columns:
+#         tasks_df = tasks_df.merge(assign_df, on="agent_id", how="left")
+#         # Convert to int (and fill agents with no tasks with -1)
+#         tasks_df["cluster_id"] = tasks_df["cluster_id"].fillna(-1).astype(int)
+#         # write back
+#         env_cfg["tasks"] = tasks_df
+#         print(f"[4.4] Added 'cluster_id' to tasks for {ep_name}/{topo_name}/{scen_name} "
+#               f"(rows={len(tasks_df)})")
+
+#     # 3) Cluster-level summary (numeric columns only, excluding cluster_id from aggregation)
+#     numeric_cols = prof.select_dtypes(include=[np.number]).columns.tolist()
+#     # Separate group key from aggregated columns
+#     agg_cols = [c for c in numeric_cols if c != "cluster_id"]
+
+#     cluster_summary = (
+#         prof[["cluster_id"] + agg_cols]
+#         .groupby("cluster_id", as_index=False)
+#         .mean()
+#         .sort_values("cluster_id")
+#     )
+
+#     cluster_sizes = (
+#         prof.groupby("cluster_id")["agent_id"]
+#         .count()
+#         .rename("n_agents_cluster")
+#         .reset_index()
+#     )
+#     cluster_summary = cluster_summary.merge(cluster_sizes, on="cluster_id", how="left")
+
+#     # 4) Decode centroids back to original scale
+#     if scaler is not None:
+#         centers_original = scaler.inverse_transform(centers_scaled)
+#     else:
+#         centers_original = centers_scaled.copy()
+
+#     centroids_scaled_df = pd.DataFrame(centers_scaled, columns=feature_cols)
+#     centroids_scaled_df.insert(0, "cluster_id", np.arange(best_K))
+
+#     centroids_original_df = pd.DataFrame(centers_original, columns=feature_cols)
+#     centroids_original_df.insert(0, "cluster_id", np.arange(best_K))
+
+#     # 5) Save to disk
+#     out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+#     os.makedirs(out_dir, exist_ok=True)
+
+#     assign_path    = os.path.join(out_dir, "cluster_assignments.csv")
+#     summary_path   = os.path.join(out_dir, "cluster_summary.csv")
+#     cent_sc_path   = os.path.join(out_dir, "centroids_scaled.csv")
+#     cent_orig_path = os.path.join(out_dir, "centroids_original.csv")
+
+#     assign_df.to_csv(assign_path, index=False)
+#     cluster_summary.to_csv(summary_path, index=False)
+#     centroids_scaled_df.to_csv(cent_sc_path, index=False)
+#     centroids_original_df.to_csv(cent_orig_path, index=False)
+
+#     print(f"[4.4] {ep_name}/{topo_name}/{scen_name} → cluster profiles built.")
+#     print(cluster_sizes.set_index("cluster_id")["n_agents_cluster"])
+
+#     # 6) Attach final results to env_cfg
+#     env_cfg["clustering"]["profiles"] = {
+#         "K": best_K,
+#         "cluster_assignments": assign_df,
+#         "cluster_summary": cluster_summary,
+#         "centroids_scaled_df": centroids_scaled_df,
+#         "centroids_original_df": centroids_original_df,
+#         "centroids_scaled": centers_scaled,
+#         "centroids_original": centers_original,
+#     }
+
+#     return env_cfg["clustering"]["profiles"]
+
+
 def build_cluster_profiles_for_env(
     ep_name: str,
     topo_name: str,
@@ -3253,7 +3415,6 @@ def build_cluster_profiles_for_env(
     centers_scaled = np.asarray(final["centers"], dtype=float)
 
     agent_ids    = feats["agent_ids"]
-    scaler       = feats["scaler"]
     feature_cols = feats["feature_cols"]
 
     prof = env_cfg["agent_profiles"].copy()
@@ -3277,6 +3438,10 @@ def build_cluster_profiles_for_env(
         print(f"[4.4] Added 'cluster_id' to tasks for {ep_name}/{topo_name}/{scen_name} "
               f"(rows={len(tasks_df)})")
 
+    # Debug: Check if cluster_id is in tasks_df and cluster_summary
+    print(f"Debug: Tasks DataFrame for {ep_name}/{topo_name}/{scen_name} includes 'cluster_id':")
+    print(tasks_df.head())
+
     # 3) Cluster-level summary (numeric columns only, excluding cluster_id from aggregation)
     numeric_cols = prof.select_dtypes(include=[np.number]).columns.tolist()
     # Separate group key from aggregated columns
@@ -3297,11 +3462,12 @@ def build_cluster_profiles_for_env(
     )
     cluster_summary = cluster_summary.merge(cluster_sizes, on="cluster_id", how="left")
 
-    # 4) Decode centroids back to original scale
-    if scaler is not None:
-        centers_original = scaler.inverse_transform(centers_scaled)
-    else:
-        centers_original = centers_scaled.copy()
+    # Debug: Check if cluster_summary has 'cluster_id'
+    print(f"Debug: Cluster summary for {ep_name}/{topo_name}/{scen_name} includes 'cluster_id':")
+    print(cluster_summary.head())
+
+    # 4) Decode centroids back to original scale (no need for scaler now)
+    centers_original = centers_scaled.copy()
 
     centroids_scaled_df = pd.DataFrame(centers_scaled, columns=feature_cols)
     centroids_scaled_df.insert(0, "cluster_id", np.arange(best_K))
@@ -3338,6 +3504,7 @@ def build_cluster_profiles_for_env(
     }
 
     return env_cfg["clustering"]["profiles"]
+
 
 def build_all_cluster_profiles(env_configs):
     out = {}
