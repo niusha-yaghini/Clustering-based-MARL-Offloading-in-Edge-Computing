@@ -2054,6 +2054,106 @@ print(prof.head())
 print(prof.columns)
 
 
+# Saving Information
+# def _ensure_dir(path: str):
+#     """Create a folder if it does not already exist."""
+#     os.makedirs(path, exist_ok=True)
+
+# def _serialize_non_df_components(env_cfg: dict) -> dict:
+#     """
+#     Prepare a JSON-serializable dictionary for all non-DataFrame parts
+#     of env_config. Arrays are converted to lists.
+#     """
+#     out = {}
+#     for key, value in env_cfg.items():
+#         if isinstance(value, pd.DataFrame):
+#             continue  # handled separately
+
+#         # numpy arrays → lists
+#         if isinstance(value, np.ndarray):
+#             out[key] = value.tolist()
+#             continue
+
+#         # dicts (queues, action_space, state_spec, checks)
+#         if isinstance(value, dict):
+#             try:
+#                 # recursively convert numpy arrays inside dicts
+#                 def _convert(obj):
+#                     if isinstance(obj, np.ndarray):
+#                         return obj.tolist()
+#                     if isinstance(obj, dict):
+#                         return {k: _convert(v) for k, v in obj.items()}
+#                     return obj
+#                 out[key] = _convert(value)
+#             except Exception as e:
+#                 out[key] = f"(serialization error: {e})"
+#             continue
+
+#         # scalars (int, float, str, None)
+#         if isinstance(value, (int, float, str, bool, type(None))):
+#             out[key] = value
+#             continue
+
+#         # Handle StandardScaler separately by serializing only its mean and scale
+#         if isinstance(value, StandardScaler):
+#             out[key] = {
+#                 "mean": value.mean_.tolist(),
+#                 "scale": value.scale_.tolist()
+#             }
+#             continue
+
+#         # fallback
+#         try:
+#             out[key] = json.loads(json.dumps(value))
+#         except Exception:
+#             out[key] = f"(unserializable type: {type(value).__name__})"
+
+#     return out
+
+# def save_all_env_configs(env_configs, out_root: str = "./artifacts/env_configs"):
+#     """
+#     Save all env_configs to disk in a structured layout:
+#         artifacts/env_configs/ep_xxx/topology/scenario/
+#             tasks_env_config.csv
+#             agents_env_config.csv
+#             arrivals_env_config.csv
+#             episodes_env_config.csv
+#             env_meta.json   <-- (non-DF components)
+#     """
+#     n_saved = 0
+
+#     for ep_name, by_topo in env_configs.items():
+#         for topo_name, by_scen in by_topo.items():
+#             for scen_name, env_cfg in by_scen.items():
+
+#                 out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+#                 _ensure_dir(out_dir)
+
+#                 # ---- Save DataFrame components ----
+#                 for df_name, df in env_cfg.items():
+#                     if isinstance(df, pd.DataFrame):
+#                         file_path_csv = os.path.join(out_dir, f"{df_name}_env_config.csv")
+#                         df.to_csv(file_path_csv, index=False)
+
+#                         print(f"[saved] {file_path_csv}  (rows={len(df)})")
+#                         n_saved += 1
+
+#                 # ---- Save non-DataFrame metadata ----
+#                 meta = _serialize_non_df_components(env_cfg)
+
+#                 meta_path = os.path.join(out_dir, "env_meta.json")
+#                 with open(meta_path, "w", encoding="utf-8") as f:
+#                     json.dump(meta, f, indent=2)
+
+#                 print(f"[saved] {meta_path}")
+
+#     print(f"\nDone. Saved {n_saved} DataFrames + meta files for all env_configs.")
+    
+
+# save_all_env_configs(env_configs, out_root="./artifacts/env_configs")
+
+
+
 
 
 
@@ -2095,11 +2195,50 @@ def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
     return [c for c in cols if c in df.columns]
 
 # Build feature matrix for one environment configuration
+# def make_agent_feature_matrix_for_env(
+#     env_cfg: Dict[str, Any],
+#     feature_list: Optional[List[str]] = None,
+#     standardize: bool = True,
+# ) -> Tuple[np.ndarray, List[str], np.ndarray, Optional[StandardScaler]]:
+#     """
+#     Build the feature matrix (X) for all agents in one environment configuration.
+#     Each row represents an agent; each column a numerical feature.
+    
+#     Returns:
+#         X_scaled       : np.ndarray (n_agents × n_features)
+#         used_cols      : list of feature names in order
+#         agent_ids      : np.ndarray of agent identifiers
+#         scaler         : fitted StandardScaler object (or None if not standardized)
+#     """
+#     if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
+#         raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
+
+#     prof = env_cfg["agent_profiles"].copy()
+#     if "agent_id" not in prof.columns:
+#         raise ValueError("agent_profiles must include column 'agent_id'.")
+
+#     if feature_list is None:
+#         feature_list = AGENT_FEATURES_V1
+
+#     # Keep valid features and fill missing ones with zeros
+#     cols = _safe_cols(prof, feature_list)
+#     X = prof.reindex(columns=cols).fillna(0.0).astype(float).to_numpy()
+#     agent_ids = prof["agent_id"].to_numpy(dtype=int)
+
+#     # Standardize features (mean=0, std=1) for clustering stability
+#     scaler = None
+#     if standardize and X.shape[0] > 0:
+#         scaler = StandardScaler()
+#         X = scaler.fit_transform(X)
+
+#     return X, cols, agent_ids, scaler
+
+# Build feature matrix for one environment configuration
 def make_agent_feature_matrix_for_env(
     env_cfg: Dict[str, Any],
     feature_list: Optional[List[str]] = None,
     standardize: bool = True,
-) -> Tuple[np.ndarray, List[str], np.ndarray, Optional[StandardScaler]]:
+) -> Tuple[np.ndarray, List[str], np.ndarray]:
     """
     Build the feature matrix (X) for all agents in one environment configuration.
     Each row represents an agent; each column a numerical feature.
@@ -2108,7 +2247,6 @@ def make_agent_feature_matrix_for_env(
         X_scaled       : np.ndarray (n_agents × n_features)
         used_cols      : list of feature names in order
         agent_ids      : np.ndarray of agent identifiers
-        scaler         : fitted StandardScaler object (or None if not standardized)
     """
     if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
         raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
@@ -2126,14 +2264,36 @@ def make_agent_feature_matrix_for_env(
     agent_ids = prof["agent_id"].to_numpy(dtype=int)
 
     # Standardize features (mean=0, std=1) for clustering stability
-    scaler = None
     if standardize and X.shape[0] > 0:
         scaler = StandardScaler()
-        X = scaler.fit_transform(X)
+        X = scaler.fit_transform(X)  # Nomalize the data
+        # Don't store scaler, we will only store the scaled data
+    else:
+        scaler = None
 
-    return X, cols, agent_ids, scaler
+    return X, cols, agent_ids
 
 # Attach computed features to the environment configuration
+# def attach_features_to_env(env_cfg: Dict[str, Any],
+#                            feature_list: Optional[List[str]] = None,
+#                            standardize: bool = True) -> Dict[str, Any]:
+#     """
+#     Attach the constructed feature matrix and related metadata
+#     to env_cfg["clustering"]["features"].
+#     """
+#     X, cols, agent_ids, scaler = make_agent_feature_matrix_for_env(env_cfg, feature_list, standardize)
+
+#     env_cfg.setdefault("clustering", {})
+#     env_cfg["clustering"]["features"] = {
+#         "X": X,                          # Feature matrix (scaled)
+#         "feature_cols": cols,            # List of column names
+#         "agent_ids": agent_ids,          # Agent identifiers
+#         "scaler": scaler,                # StandardScaler (for later inverse transform)
+#         "n_agents": int(X.shape[0]),
+#         "n_features": int(X.shape[1]),
+#     }
+#     return env_cfg
+
 def attach_features_to_env(env_cfg: Dict[str, Any],
                            feature_list: Optional[List[str]] = None,
                            standardize: bool = True) -> Dict[str, Any]:
@@ -2143,12 +2303,12 @@ def attach_features_to_env(env_cfg: Dict[str, Any],
     """
     X, cols, agent_ids, scaler = make_agent_feature_matrix_for_env(env_cfg, feature_list, standardize)
 
+    # We do not store 'scaler' as it is not JSON serializable
     env_cfg.setdefault("clustering", {})
     env_cfg["clustering"]["features"] = {
         "X": X,                          # Feature matrix (scaled)
         "feature_cols": cols,            # List of column names
         "agent_ids": agent_ids,          # Agent identifiers
-        "scaler": scaler,                # StandardScaler (for later inverse transform)
         "n_agents": int(X.shape[0]),
         "n_features": int(X.shape[1]),
     }
@@ -3288,95 +3448,103 @@ for ep in env_configs:
             )
  
 
-# Saving Information
-def _ensure_dir(path: str):
-    """Create a folder if it does not already exist."""
-    os.makedirs(path, exist_ok=True)
+# # Saving Information
+# def _ensure_dir(path: str):
+#     """Create a folder if it does not already exist."""
+#     os.makedirs(path, exist_ok=True)
 
-def _serialize_non_df_components(env_cfg: dict) -> dict:
-    """
-    Prepare a JSON-serializable dictionary for all non-DataFrame parts
-    of env_config. Arrays are converted to lists.
-    """
-    out = {}
-    for key, value in env_cfg.items():
-        if isinstance(value, pd.DataFrame):
-            continue  # handled separately
+# def _serialize_non_df_components(env_cfg: dict) -> dict:
+#     """
+#     Prepare a JSON-serializable dictionary for all non-DataFrame parts
+#     of env_config. Arrays are converted to lists.
+#     """
+#     out = {}
+#     for key, value in env_cfg.items():
+#         if isinstance(value, pd.DataFrame):
+#             continue  # handled separately
 
-        # numpy arrays → lists
-        if isinstance(value, np.ndarray):
-            out[key] = value.tolist()
-            continue
+#         # numpy arrays → lists
+#         if isinstance(value, np.ndarray):
+#             out[key] = value.tolist()
+#             continue
 
-        # dicts (queues, action_space, state_spec, checks)
-        if isinstance(value, dict):
-            try:
-                # recursively convert numpy arrays inside dicts
-                def _convert(obj):
-                    if isinstance(obj, np.ndarray):
-                        return obj.tolist()
-                    if isinstance(obj, dict):
-                        return {k: _convert(v) for k, v in obj.items()}
-                    return obj
-                out[key] = _convert(value)
-            except Exception as e:
-                out[key] = f"(serialization error: {e})"
-            continue
+#         # dicts (queues, action_space, state_spec, checks)
+#         if isinstance(value, dict):
+#             try:
+#                 # recursively convert numpy arrays inside dicts
+#                 def _convert(obj):
+#                     if isinstance(obj, np.ndarray):
+#                         return obj.tolist()
+#                     if isinstance(obj, dict):
+#                         return {k: _convert(v) for k, v in obj.items()}
+#                     return obj
+#                 out[key] = _convert(value)
+#             except Exception as e:
+#                 out[key] = f"(serialization error: {e})"
+#             continue
 
-        # scalars (int, float, str, None)
-        if isinstance(value, (int, float, str, bool, type(None))):
-            out[key] = value
-            continue
+#         # scalars (int, float, str, None)
+#         if isinstance(value, (int, float, str, bool, type(None))):
+#             out[key] = value
+#             continue
 
-        # fallback
-        try:
-            out[key] = json.loads(json.dumps(value))
-        except Exception:
-            out[key] = f"(unserializable type: {type(value).__name__})"
+#         # Handle StandardScaler separately by serializing only its mean and scale
+#         if isinstance(value, StandardScaler):
+#             out[key] = {
+#                 "mean": value.mean_.tolist(),
+#                 "scale": value.scale_.tolist()
+#             }
+#             continue
 
-    return out
+#         # fallback
+#         try:
+#             out[key] = json.loads(json.dumps(value))
+#         except Exception:
+#             out[key] = f"(unserializable type: {type(value).__name__})"
 
-def save_all_env_configs(env_configs, out_root: str = "./artifacts/env_configs"):
-    """
-    Save all env_configs to disk in a structured layout:
-        artifacts/env_configs/ep_xxx/topology/scenario/
-            tasks_env_config.csv
-            agents_env_config.csv
-            arrivals_env_config.csv
-            episodes_env_config.csv
-            env_meta.json   <-- (non-DF components)
-    """
-    n_saved = 0
+#     return out
 
-    for ep_name, by_topo in env_configs.items():
-        for topo_name, by_scen in by_topo.items():
-            for scen_name, env_cfg in by_scen.items():
+# def save_all_env_configs(env_configs, out_root: str = "./artifacts/env_configs"):
+#     """
+#     Save all env_configs to disk in a structured layout:
+#         artifacts/env_configs/ep_xxx/topology/scenario/
+#             tasks_env_config.csv
+#             agents_env_config.csv
+#             arrivals_env_config.csv
+#             episodes_env_config.csv
+#             env_meta.json   <-- (non-DF components)
+#     """
+#     n_saved = 0
 
-                out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
-                _ensure_dir(out_dir)
+#     for ep_name, by_topo in env_configs.items():
+#         for topo_name, by_scen in by_topo.items():
+#             for scen_name, env_cfg in by_scen.items():
 
-                # ---- Save DataFrame components ----
-                for df_name, df in env_cfg.items():
-                    if isinstance(df, pd.DataFrame):
-                        file_path_csv = os.path.join(out_dir, f"{df_name}_env_config.csv")
-                        df.to_csv(file_path_csv, index=False)
+#                 out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+#                 _ensure_dir(out_dir)
 
-                        print(f"[saved] {file_path_csv}  (rows={len(df)})")
-                        n_saved += 1
+#                 # ---- Save DataFrame components ----
+#                 for df_name, df in env_cfg.items():
+#                     if isinstance(df, pd.DataFrame):
+#                         file_path_csv = os.path.join(out_dir, f"{df_name}_env_config.csv")
+#                         df.to_csv(file_path_csv, index=False)
 
-                # ---- Save non-DataFrame metadata ----
-                meta = _serialize_non_df_components(env_cfg)
+#                         print(f"[saved] {file_path_csv}  (rows={len(df)})")
+#                         n_saved += 1
 
-                meta_path = os.path.join(out_dir, "env_meta.json")
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, indent=2)
+#                 # ---- Save non-DataFrame metadata ----
+#                 meta = _serialize_non_df_components(env_cfg)
 
-                print(f"[saved] {meta_path}")
+#                 meta_path = os.path.join(out_dir, "env_meta.json")
+#                 with open(meta_path, "w", encoding="utf-8") as f:
+#                     json.dump(meta, f, indent=2)
 
-    print(f"\nDone. Saved {n_saved} DataFrames + meta files for all env_configs.")
+#                 print(f"[saved] {meta_path}")
 
+#     print(f"\nDone. Saved {n_saved} DataFrames + meta files for all env_configs.")
+    
 
-save_all_env_configs(env_configs, out_root="./artifacts/env_configs")
+# save_all_env_configs(env_configs, out_root="./artifacts/env_configs")
 
 
 

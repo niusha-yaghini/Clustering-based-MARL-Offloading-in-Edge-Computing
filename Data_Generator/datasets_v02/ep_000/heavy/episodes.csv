@@ -1,2 +1,0 @@
-scenario,episode_id,Delta,T_slots,arrival_slots,drain_slots,hours,N_agents
-heavy,0,1.0,110,100,10,0.030555555555555555,18

@@ -1,2 +1,0 @@
-n_tasks,n_arrivals,tasks_per_hour,b_mb_median,rho_median,c_cycles_p99,deadline_share,non_atomic_share
-231,231,7560.0,3.1108969493803675,1217885032.635759,9993904801.59955,0.23809523809523808,0.3203463203463203
