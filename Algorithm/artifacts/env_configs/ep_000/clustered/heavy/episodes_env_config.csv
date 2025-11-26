@@ -1,2 +1,0 @@
-scenario,episode_id,Delta,T_slots,T_decision,T_drain,hours,N_agents,seed
-heavy,0,1.0,110,100,10,0.030555556,18,345
