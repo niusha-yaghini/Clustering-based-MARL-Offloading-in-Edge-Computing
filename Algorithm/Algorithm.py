@@ -2332,7 +2332,7 @@ def run_feature_matrix_sanity_checks(env_configs: Dict[str, Dict[str, Dict[str, 
                 if X.shape[1] == 0:
                     raise AssertionError(f"{where}: Empty feature matrix.")
     print("[checks] All sanity checks passed successfully.")
-        
+            
 
 # Build feature matrices for all envs
 env_configs = attach_features_to_all_envs(env_configs, feature_list=AGENT_FEATURES_V1, standardize=True)
@@ -2364,37 +2364,6 @@ print("agent_ids[:10]:", fz["agent_ids"][:10])
 
 
 # 4.2. Optimal Number of Clusters
-
-# Uses feature matrix from Step 4.1:
-#   env_cfg["clustering"]["features"] = {
-#       "X", "feature_cols", "agent_ids",
-#       "scaler", "n_agents", "n_features"
-#   }
-#
-# For each (episode → topology → scenario) we:
-#   1) Build candidate K set based on n_agents.
-#   2) Run KMeans for each K.
-#   3) Compute metrics:
-#        - inertia (WCSS)
-#        - silhouette
-#        - Calinski–Harabasz
-#        - Davies–Bouldin
-#   4) Normalize them and compute composite score:
-#        Score(K) = α·Sil_norm(K) + β·CH_norm(K) − γ·DB_norm(K)
-#   5) Compute elbow_score from inertia curvature.
-#   6) Select:
-#        best_K  = argmax(Score(K))
-#        K_elbow = argmax(elbow_score)
-#   7) Save plot: elbow + composite score per triple:
-#        ./artifacts/clustering/<ep>/<topology>/<scenario>/elbow_and_score.png
-#
-# Results are attached to:
-#   env_cfg["clustering"]["k_selection"] = {
-#       "metrics_df", "best_K", "K_elbow", "elbow_plot_path"
-#   }
-# And returned as:
-#   K_selection[ep][topology][scenario] = {...}
-# ===============================================
 
 # ---------- 4.2.1 Candidate K values ----------
 def _candidate_K_values(
@@ -2824,8 +2793,7 @@ if (ex_ep in K_selection and
         ].round(4)
     )
 else:
-    print("[warn] Example triple (ep_000/clustered/heavy) not found in K_selection.")
-        
+    print("[warn] Example triple (ep_000/clustered/heavy) not found in K_selection.")        
     
     
 # The checkups !!! (the charts are alike)
@@ -2890,23 +2858,6 @@ for topo in ["clustered", "full_mesh", "sparse_ring"]:
 
 
 # 4.3. Implementing K-Means Clustering
-
-# For each (episode → topology → scenario), we:
-#   1) Fetch best_K from step 4.2
-#   2) Run K-Means (once) using best_K
-#   3) Store:
-#        - cluster_labels (per agent)
-#        - cluster_centers (scaled feature space)
-#        - agent_ids for mapping
-#
-# Results written to:
-#   env_cfg["clustering"]["final"] = {
-#       "K": best_K,
-#       "labels": np.ndarray shape (n_agents,),
-#       "centers": np.ndarray shape (K, n_features),
-#       "agent_ids": np.ndarray
-#   }
-# ======================================================
 
 def step4_3_run_final_kmeans_for_all_envs(
     env_configs: Dict[str, Dict[str, Dict[str, Any]]],
@@ -3173,7 +3124,6 @@ step4_3_plot_clusters_tsne(env_configs, verbose=True)
 
 
 # 4.4. Cluster Interpretation & Profiling
-
 def build_cluster_profiles_for_env(
     ep_name: str,
     topo_name: str,
@@ -3409,102 +3359,42 @@ for ep in env_configs:
  
 
 # # Saving Information
-# def _ensure_dir(path: str):
-#     """Create a folder if it does not already exist."""
-#     os.makedirs(path, exist_ok=True)
+def save_env_configs_to_csv(env_configs, out_root="./artifacts/env_configs"):
+    """
+    Save the env_configs data to CSV format in the appropriate folders based on ep, topology, and scenario.
+    """
+    # Loop through each ep in env_configs
+    for ep_name, by_topo in env_configs.items():
+        for topo_name, by_scen in by_topo.items():
+            for scen_name, env_cfg in by_scen.items():
+                # Create the folders for each ep, topology, and scenario
+                out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
+                os.makedirs(out_dir, exist_ok=True)
+                
+                # Save the existing DataFrames in env_cfg to CSV files
+                if "agent_profiles" in env_cfg:
+                    agent_profiles_path = os.path.join(out_dir, "agent_profiles.csv")
+                    env_cfg["agent_profiles"].to_csv(agent_profiles_path, index=False)
+                    print(f"[save] agent_profiles saved to {agent_profiles_path}")
 
-# def _serialize_non_df_components(env_cfg: dict) -> dict:
-#     """
-#     Prepare a JSON-serializable dictionary for all non-DataFrame parts
-#     of env_config. Arrays are converted to lists.
-#     """
-#     out = {}
-#     for key, value in env_cfg.items():
-#         if isinstance(value, pd.DataFrame):
-#             continue  # handled separately
+                if "tasks" in env_cfg:
+                    tasks_path = os.path.join(out_dir, "tasks.csv")
+                    env_cfg["tasks"].to_csv(tasks_path, index=False)
+                    print(f"[save] tasks saved to {tasks_path}")
 
-#         # numpy arrays → lists
-#         if isinstance(value, np.ndarray):
-#             out[key] = value.tolist()
-#             continue
+                if "clustering" in env_cfg:
+                    clustering_path = os.path.join(out_dir, "clustering.csv")
+                    # If clustering data needs to be saved
+                    pd.DataFrame(env_cfg["clustering"]).to_csv(clustering_path, index=False)
+                    print(f"[save] clustering saved to {clustering_path}")
 
-#         # dicts (queues, action_space, state_spec, checks)
-#         if isinstance(value, dict):
-#             try:
-#                 # recursively convert numpy arrays inside dicts
-#                 def _convert(obj):
-#                     if isinstance(obj, np.ndarray):
-#                         return obj.tolist()
-#                     if isinstance(obj, dict):
-#                         return {k: _convert(v) for k, v in obj.items()}
-#                     return obj
-#                 out[key] = _convert(value)
-#             except Exception as e:
-#                 out[key] = f"(serialization error: {e})"
-#             continue
+                # If there are other data to be saved, you can add them here
+                # For example, if "tasks_df" exists, you can save it as well
 
-#         # scalars (int, float, str, None)
-#         if isinstance(value, (int, float, str, bool, type(None))):
-#             out[key] = value
-#             continue
+    print(f"[save] All data has been saved in the folder {out_root}.")
 
-#         # Handle StandardScaler separately by serializing only its mean and scale
-#         if isinstance(value, StandardScaler):
-#             out[key] = {
-#                 "mean": value.mean_.tolist(),
-#                 "scale": value.scale_.tolist()
-#             }
-#             continue
-
-#         # fallback
-#         try:
-#             out[key] = json.loads(json.dumps(value))
-#         except Exception:
-#             out[key] = f"(unserializable type: {type(value).__name__})"
-
-#     return out
-
-# def save_all_env_configs(env_configs, out_root: str = "./artifacts/env_configs"):
-#     """
-#     Save all env_configs to disk in a structured layout:
-#         artifacts/env_configs/ep_xxx/topology/scenario/
-#             tasks_env_config.csv
-#             agents_env_config.csv
-#             arrivals_env_config.csv
-#             episodes_env_config.csv
-#             env_meta.json   <-- (non-DF components)
-#     """
-#     n_saved = 0
-
-#     for ep_name, by_topo in env_configs.items():
-#         for topo_name, by_scen in by_topo.items():
-#             for scen_name, env_cfg in by_scen.items():
-
-#                 out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
-#                 _ensure_dir(out_dir)
-
-#                 # ---- Save DataFrame components ----
-#                 for df_name, df in env_cfg.items():
-#                     if isinstance(df, pd.DataFrame):
-#                         file_path_csv = os.path.join(out_dir, f"{df_name}_env_config.csv")
-#                         df.to_csv(file_path_csv, index=False)
-
-#                         print(f"[saved] {file_path_csv}  (rows={len(df)})")
-#                         n_saved += 1
-
-#                 # ---- Save non-DataFrame metadata ----
-#                 meta = _serialize_non_df_components(env_cfg)
-
-#                 meta_path = os.path.join(out_dir, "env_meta.json")
-#                 with open(meta_path, "w", encoding="utf-8") as f:
-#                     json.dump(meta, f, indent=2)
-
-#                 print(f"[saved] {meta_path}")
-
-#     print(f"\nDone. Saved {n_saved} DataFrames + meta files for all env_configs.")
-    
-
-# save_all_env_configs(env_configs, out_root="./artifacts/env_configs")
+# Using the function
+save_env_configs_to_csv(env_configs)
 
 
 
