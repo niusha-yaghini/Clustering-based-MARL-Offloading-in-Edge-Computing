@@ -3402,3 +3402,228 @@ save_env_configs_to_csv(env_configs)
 
 # Step 5: MDP Environment
 
+# Step 5.2 - Action Semantics (Contextual Bandit)
+def select_algo_for_cluster(cluster_profile):
+    """
+    Select an RL algorithm for each cluster based on its profile.
+    The profile can include information like lambda_mean, task types, etc.
+    """
+    if cluster_profile["lambda_mean"] > 0.5 and cluster_profile["P_compute_intensive"] > 0.5:
+        return "PPO"
+    elif cluster_profile["lambda_mean"] < 0.5 and cluster_profile["P_general"] > 0.5:
+        return "DQN"
+    else:
+        return "A2C"
+
+
+# Step 5.1 - State Construction
+# Example of scaling a feature array
+def normalize_feature_array(features):
+    scaler = StandardScaler()
+    return scaler.fit_transform(features.reshape(-1, 1))  # Assuming features are in a 1D array
+
+class OffloadingEnv:
+    def __init__(self, env_cfg):
+        self.env_cfg = env_cfg
+        self.delta = env_cfg["Delta"]
+        self.t_slots = env_cfg["T_slots"]
+        self.agent_profiles = env_cfg["agent_profiles"]
+        self.alpha = 1.0  # Weight for delay penalty
+        self.beta = 1.0   # Weight for drop penalty
+        
+        # Initialize the queues for each agent
+        self.queues = {agent_id: {'local': [], 'mec': [], 'cloud': []} for agent_id in self.agent_profiles["agent_id"]}
+        
+        # Initialize other environment variables like CPU/memory
+        self.cpu_capacity = env_cfg["private_cpu"]
+        self.cloud_capacity = env_cfg["cloud_cpu"]
+        
+        # Initialize the algorithm mapping for each cluster
+        self.algo_map = self.assign_algorithms_to_clusters()
+
+    def assign_algorithms_to_clusters(self):
+        """
+        Assign RL algorithms to clusters based on their profiles.
+        """
+        algo_map = {}
+        for cluster_id, cluster_profile in self.env_cfg["clustering"]["profiles"].items():
+            algo_type = select_algo_for_cluster(cluster_profile)
+            algo_map[cluster_id] = {"type": algo_type, "agent": None}
+        return algo_map
+
+    def reset(self):
+        """Reset the environment for a new episode."""
+        for agent_id in self.queues:
+            self.queues[agent_id] = {'local': [], 'mec': [], 'cloud': []}
+        return self._get_state()
+
+    def step(self, actions):
+        """
+        Perform one step in the environment for each agent.
+        actions: dict of {agent_id: action}
+        """
+        # Update the queues based on actions
+        for agent_id, action in actions.items():
+            if action == 0:  # LOCAL
+                # Add task to local queue
+                self.queues[agent_id]['local'].append(self._get_task(agent_id))
+            elif action == 1:  # MEC
+                # Add task to MEC queue
+                self.queues[agent_id]['mec'].append(self._get_task(agent_id))
+            elif action == 2:  # CLOUD
+                # Add task to Cloud queue
+                self.queues[agent_id]['cloud'].append(self._get_task(agent_id))
+
+        # Process tasks in queues (FIFO)
+        self._process_queues()
+
+        # Calculate reward for each agent based on task completions, delays, etc.
+        rewards = self._calculate_rewards()
+
+        # Update state
+        next_state = self._get_state()
+
+        # Check if episode is done (based on T_slots)
+        done = self._check_done()
+
+        return next_state, rewards, done, {}
+  
+    def _process_queues(self):
+        """Process tasks in the queues based on GPS and FIFO."""
+        total_active_queues = sum([1 for queues in self.queues.values() if any(queue) for queue in queues.values()])
+        cpu_share = self.cpu_capacity / total_active_queues if total_active_queues > 0 else 0
+
+        for agent_id, queues in self.queues.items():
+            for queue_name, queue in queues.items():
+                # If there are tasks in the queue, process them
+                if queue:
+                    task = queue.pop(0)  # FIFO
+                    task_processing_time = task["c_cycles"] / cpu_share  # Assuming equal CPU share
+                    # Process the task (you may want to add logic for processing based on GPS share here)
+                    self._task_complete(agent_id, task, queue_name)
+
+                    # Update the queue state after processing the task
+                    print(f"Processed task for agent {agent_id} in {queue_name} queue, estimated time: {task_processing_time:.2f} cycles.")
+
+    def _task_complete(self, agent_id, task, queue_name):
+        """Handle task completion (can be expanded with delay/drop logic)."""
+        print(f"Task completed for agent {agent_id} in {queue_name} queue.")
+        # Here you can implement delay or drop logic if required.
+    
+    def _calculate_rewards(self):
+        """Calculate reward based on task delays, drop rates, etc."""
+        rewards = {}
+        for agent_id, queues in self.queues.items():
+            for queue_name, queue in queues.items():
+                if queue:  # If there are tasks in the queue
+                    task = queue[0]  # Take the first task for reward calculation
+                    task_completion_time = self._calculate_task_time(task)
+                    delay = self._calculate_delay(task, task_completion_time)
+                    drop = self._check_task_drop(task)
+
+                    # Reward calculation based on delay and drop
+                    rewards[agent_id] = -self.alpha * delay - self.beta * drop
+        return rewards
+    
+    def _calculate_task_time(self, task):
+        """Calculate the total processing time for a task."""
+        # Here we calculate total time based on task's computation cycles
+        # For now, assuming constant computation power, you can update based on more detailed logic
+        processing_time = task["c_cycles"] / self.cpu_capacity  # Example logic
+        return processing_time
+
+    def _calculate_delay(self, task, completion_time):
+        """Calculate delay based on the task's total execution time and its deadline."""
+        # Assuming task has a deadline attribute
+        if "deadline_slots" in task and task["deadline_slots"] > 0:
+            delay = max(0, completion_time - task["deadline_slots"])  # Time past the deadline
+            return delay
+        return 0  # No delay if no deadline
+    
+    def _check_task_drop(self, task):
+        """Check if the task is dropped due to exceeding its deadline."""
+        if "deadline_slots" in task and task["deadline_slots"] > 0:
+            if task["deadline_slots"] <= 0:  # If deadline is violated
+                return 1  # Drop penalty
+        return 0  # No drop if deadline is not violated
+
+    # Update _get_state to normalize relevant features
+    def _get_state(self):
+        """Return the state for each agent, which includes queue lengths, resources, etc."""
+        state = {}
+        for agent_id, queues in self.queues.items():
+            # Retrieve features from tasks and agent profile for state
+            task_features = self._get_task_features(agent_id)
+            agent_profile = self.agent_profiles.loc[self.agent_profiles['agent_id'] == agent_id]
+            cluster_id = agent_profile["cluster_id"].values[0]  # Assuming cluster_id exists in agent_profiles
+            
+            # Normalize the relevant task features and agent profile features
+            task_features["b_mb"] = normalize_feature_array(task_features["b_mb"])
+            task_features["c_cycles"] = normalize_feature_array(task_features["c_cycles"])
+            task_features["mem_mb"] = normalize_feature_array(task_features["mem_mb"])
+            task_features["rho_cyc_per_mb"] = normalize_feature_array(task_features["rho_cyc_per_mb"])
+
+            state[agent_id] = {
+                "local_queue_length": len(queues['local']),
+                "mec_queue_length": len(queues['mec']),
+                "cloud_queue_length": len(queues['cloud']),
+                "task_features": task_features,  # Features related to the current task
+                "agent_profile": agent_profile,  # Agent's resource profile (lambda, etc.)
+                "cluster_id": self._one_hot_cluster(cluster_id)  # One-hot encode cluster_id
+            }
+        return state
+
+    # One-hot encoding for task type and cluster id
+    def _one_hot_task_type(task_type):
+        task_types = ['general', 'latency_sensitive', 'compute_intensive', 'data_intensive', 'deadline_hard']
+        task_type_onehot = [0] * len(task_types)
+        if task_type in task_types:
+            task_type_onehot[task_types.index(task_type)] = 1
+        return task_type_onehot
+
+    def _one_hot_cluster(self, cluster_id):
+        """One-hot encode the cluster_id."""
+        num_clusters = self.env_cfg["clustering"]["profiles"]["K"]
+        cluster_onehot = [0] * num_clusters
+        cluster_onehot[cluster_id] = 1
+        return cluster_onehot
+
+    # Update task features to include one-hot encoding for task_type
+    def _get_task_features(self, agent_id):
+        """Get the current task features for the agent from the pre-generated tasks."""
+        tasks_df = self.env_cfg['tasks']
+        agent_tasks = tasks_df[tasks_df['agent_id'] == agent_id]
+        
+        if not agent_tasks.empty:
+            task = agent_tasks.iloc[0]
+            task_features = {
+                "b_mb": task["b_mb"],
+                "c_cycles": task["c_cycles"],
+                "mem_mb": task["mem_mb"],
+                "rho_cyc_per_mb": task["rho_cyc_per_mb"],
+                "deadline_slots": task["deadline_slots"],
+                "task_type": self._one_hot_task_type(task["task_type"]),  # One-hot encode task_type
+            }
+            return task_features
+        else:
+            return {}  # If no tasks for this agent, return an empty dictionary
+    
+    def _check_done(self):
+        """Check if the episode is done (based on T_slots)."""
+        # If the number of slots (T_slots) has been completed, end the episode
+        if self.t_slots <= 0:
+            # Save the statistics of the episode like delays, drop rate, etc.
+            self._log_episode_statistics()
+            return True
+        return False
+
+    def _log_episode_statistics(self):
+        """Log the statistics of the current episode."""
+        # Calculate and log relevant statistics such as average delay, drop rate, and reward
+        print("Logging statistics for the episode...")
+        # Example (you can modify this based on your requirement):
+        avg_delay = np.mean([self._calculate_delay(task, self._calculate_task_time(task)) for task in self._get_all_tasks()])
+        avg_drop_rate = np.mean([self._check_task_drop(task) for task in self._get_all_tasks()])
+        
+        print(f"Average Delay: {avg_delay}, Average Drop Rate: {avg_drop_rate}")
+        # You can also save these statistics to a file or a list for further analysis
