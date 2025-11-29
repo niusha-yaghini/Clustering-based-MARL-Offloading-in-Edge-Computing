@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Data generator for Edge–MEC–Cloud with Poisson arrivals (per-second),
-lognormal task features (parameterized by median & sigma_g), and policy-agnostic outputs.
+discrete task sizes (uniform integers in [task_size_min_mb, task_size_max_mb]),
+lognormal compute & memory features, and policy-agnostic outputs.
 
 HOODIE-style timing:
-  - Each episode has T = 110 time-slots:
-      * T_decision = 100 slots for decision-making (with arrivals)
-      * T_drain    = 10 slots for draining queues (NO new arrivals)
+  - Each episode has T slots:
+      * T_decision slots for decision-making (with arrivals)
+      * T_drain   slots for draining queues (NO new arrivals)
   - DRL environment can later consume this as event-driven using the time-stamps.
 
-Supports THREE SCENARIOS (light / moderate / heavy) similar to HOODIE experiments.
+Supports THREE SCENARIOS (light / moderate / heavy).
 For each episode we:
   - synthesize time-stamped arrivals and task features for ALL scenarios
   - save CSV + a per-episode dataset_metadata.json
@@ -34,32 +35,59 @@ Directory layout (per episode):
 """
 
 from __future__ import annotations
+
+import os
+import json
+import math
+import time
+import random
+import platform
+import getpass
 from dataclasses import dataclass, asdict, replace
 from typing import List, Dict, Optional
+
 import numpy as np
 import pandas as pd
-import random, math, os, json
 import matplotlib.pyplot as plt
-import hashlib, time, platform, getpass
 
-# -------------------------
-# reproducibility
-# -------------------------
-GLOBAL_SEED = 42
+# ============================================================
+# Load configuration from JSON
+# ============================================================
+
+CONFIG_PATH = "taskgen_config.json"  # adjust path if needed
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CFG = json.load(f)
+
+# Global seed and RNGs
+GLOBAL_SEED = CFG["global_seed"]
 rng_global = np.random.default_rng(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
 np.random.seed(GLOBAL_SEED)
 
-# -------------------------
+# Dataset-level config (used later in main)
+DATASET_CFG = CFG.get("dataset", {})
+DATASET_EPISODES_EACH = DATASET_CFG.get("episodes_each", 1)
+DATASET_OUT_ROOT = DATASET_CFG.get("out_root", "./datasets")
+DATASET_QCAP = DATASET_CFG.get("qcap", 0.99)
+
+# Task-level config (task size range)
+TASK_CFG = CFG["task"]
+TASK_SIZE_MIN_MB = TASK_CFG["task_size_min_mb"]
+TASK_SIZE_MAX_MB = TASK_CFG["task_size_max_mb"]
+
+# ============================================================
 # configuration dataclasses
-# -------------------------
+# ============================================================
+
 @dataclass
 class EpisodeConf:
     Delta: float        # seconds per slot
-    T_slots: int        # total number of slots in the episode (e.g. 110)
-    T_decision: int     # number of slots with arrivals (e.g. 100)
-    T_drain: int        # number of drain slots without arrivals (e.g. 10)
+    T_slots: int        # total number of slots in the episode
+    T_decision: int     # number of slots with arrivals
+    T_drain: int        # number of drain slots without arrivals
     seed: int
+
 
 @dataclass
 class AgentRanges:
@@ -72,10 +100,11 @@ class AgentRanges:
     m_local_min: float
     m_local_max: float
 
+
 @dataclass
 class TaskFeatureDist:
     # Lognormal parameterization via median and sigma_g (geometric std).
-    b_median: float = 3.0          # MB
+    b_median: float = 3.0          # MB (kept for metadata; actual size is discrete now)
     b_sigma_g: float = 1.5
 
     rho_median: float = 1.2e9      # cycles / MB
@@ -96,6 +125,7 @@ class TaskFeatureDist:
     modality_probs: Optional[List[float]] = None
     modality_labels: List[str] = None
 
+
 @dataclass
 class GlobalConfig:
     name: str
@@ -104,9 +134,11 @@ class GlobalConfig:
     AgentRanges: AgentRanges
     TaskDist: TaskFeatureDist
 
-# -------------------------
+
+# ============================================================
 # asserts / validation
-# -------------------------
+# ============================================================
+
 def _validate_cfg(cfg: GlobalConfig) -> None:
     assert cfg.N_agents > 0
     assert cfg.Episode.Delta > 0
@@ -123,16 +155,18 @@ def _validate_cfg(cfg: GlobalConfig) -> None:
     # geometric std must be >= 1.0
     assert td.b_sigma_g >= 1.0 and td.rho_sigma_g >= 1.0 and td.mem_sigma_g >= 1.0
 
-# -------------------------
-# helpers
-# -------------------------
+
+# ============================================================
+# helpers (lognormal quantiles)
+# ============================================================
+
 _Z_TABLE = {
     0.90: 1.2815515655446004,
     0.95: 1.6448536269514722,
     0.975: 1.959963984540054,
     0.99: 2.3263478740408408,
     0.995: 2.5758293035489004,
-    0.999: 3.090232306167813
+    0.999: 3.090232306167813,
 }
 
 def _z_from_p(p: float) -> float:
@@ -167,15 +201,18 @@ def lognormal_from_median_sigma_g(
         x = min(x, cap)
     return x
 
-# -------------------------
+
+# ============================================================
 # entities
-# -------------------------
+# ============================================================
+
 @dataclass
 class Agent:
     agent_id: int
     f_local: float
     m_local: float
     lam_sec: float   # Poisson rate per second (not per-slot)
+
 
 def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
     agents: List[Agent] = []
@@ -186,11 +223,18 @@ def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
         agents.append(Agent(agent_id=i, f_local=f_loc, m_local=m_loc, lam_sec=lam_sec))
     return agents
 
-# -------------------------
+
+# ============================================================
 # task features
-# -------------------------
+# ============================================================
+
 def _modality_choice(rng: np.random.Generator, d: TaskFeatureDist) -> str:
-    labels = d.modality_labels or ["image", "video", "text", "sensor"]
+    # modality labels and probabilities
+    if d.modality_labels is None:
+        labels = ["image", "video", "text", "sensor"]
+    else:
+        labels = d.modality_labels
+
     if d.modality_probs is None:
         probs = [0.3, 0.2, 0.3, 0.2]
     else:
@@ -198,9 +242,21 @@ def _modality_choice(rng: np.random.Generator, d: TaskFeatureDist) -> str:
         assert abs(sum(probs) - 1.0) < 1e-6 and len(probs) == len(labels)
     return rng.choice(labels, p=probs)
 
+
 def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: float = 0.99) -> Dict[str, float]:
+    """
+    Sample a single task's features.
+
+    - Task size (b_mb) is now discrete uniform integer in [TASK_SIZE_MIN_MB, TASK_SIZE_MAX_MB].
+    - Compute density (rho) and memory (mem_mb) remain lognormal.
+    """
     d = cfg.TaskDist
-    b_mb   = lognormal_from_median_sigma_g(rng, d.b_median,   d.b_sigma_g,   qcap=qcap)
+
+    # Discrete uniform task size (MB) from JSON config
+    task_size_min = TASK_SIZE_MIN_MB
+    task_size_max = TASK_SIZE_MAX_MB
+    b_mb = int(rng.integers(task_size_min, task_size_max + 1))
+
     rho    = lognormal_from_median_sigma_g(rng, d.rho_median, d.rho_sigma_g, qcap=qcap)
     c      = b_mb * rho                              # total cycles
     mem_mb = lognormal_from_median_sigma_g(rng, d.mem_median, d.mem_sigma_g, qcap=qcap)
@@ -217,9 +273,11 @@ def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: floa
         has_deadline=has_deadline, deadline_s=deadline_s, non_atomic=non_atomic, split_ratio=split_ratio
     )
 
-# -------------------------
+
+# ============================================================
 # episode generator (arrivals only)
-# -------------------------
+# ============================================================
+
 def run_episode(
     cfg: GlobalConfig,
     agents: List[Agent],
@@ -372,9 +430,11 @@ def run_episode(
         "tasks":    tasks_df
     }
 
-# -------------------------
+
+# ============================================================
 # save & plotting utilities
-# -------------------------
+# ============================================================
+
 def save_dataset(dfs: Dict[str, pd.DataFrame], out_dir: str = ".") -> Dict[str, str]:
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
@@ -384,6 +444,7 @@ def save_dataset(dfs: Dict[str, pd.DataFrame], out_dir: str = ".") -> Dict[str, 
         paths[name + "_csv"] = csv_path
     return paths
 
+
 def _config_fingerprint(cfg: GlobalConfig) -> str:
     s = json.dumps({
         "scenario": cfg.name,
@@ -392,6 +453,7 @@ def _config_fingerprint(cfg: GlobalConfig) -> str:
         "TaskDist": asdict(cfg.TaskDist)
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
+
 
 def save_episode_meta(
     cfgs: List[GlobalConfig],
@@ -454,6 +516,7 @@ def save_episode_meta(
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return path
 
+
 def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     tasks = dfs["tasks"].copy()
@@ -510,7 +573,7 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         plt.close()
 
     if len(tasks):
-        hist_plot(tasks["b_mb"],            title="Task size (MB)",                fname="hist_b_mb.png", logx=True)
+        hist_plot(tasks["b_mb"],            title="Task size (MB)",                fname="hist_b_mb.png", logx=False)
         hist_plot(tasks["rho_cyc_per_mb"],  title="Compute density (cycles/MB)",   fname="hist_rho.png",  logx=True)
         hist_plot(tasks["c_cycles"],        title="Total cycles",                  fname="hist_c_cycles.png", logx=True)
         hist_plot(tasks["deadline_s"],      title="Deadline (s)",                  fname="hist_deadline_s.png", logx=False)
@@ -529,77 +592,132 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         plt.savefig(os.path.join(out_dir, "bar_arrivals_per_agent.png"), dpi=160)
         plt.close()
 
-# -------------------------
-# scenario presets (light / moderate / heavy) – HOODIE-style timing
-# -------------------------
-DEFAULT_DELTA = 1.0      # 1 second per slot (unit choice)
-T_DECISION = 100         # 100 decision slots
-T_DRAIN    = 10          # 10 drain slots
-DEFAULT_T_SLOTS = T_DECISION + T_DRAIN  # 110 total
+
+# ============================================================
+# scenario presets (constructed from JSON)
+# ============================================================
+
+# Episode base from JSON
+EPISODE_CFG = CFG["episode"]
+DELTA      = EPISODE_CFG["delta"]
+T_DECISION = EPISODE_CFG["t_decision"]
+T_DRAIN    = EPISODE_CFG["t_drain"]
+T_SLOTS    = T_DECISION + T_DRAIN
 
 BASE_EPISODE = EpisodeConf(
-    Delta=DEFAULT_DELTA,
-    T_slots=DEFAULT_T_SLOTS,
+    Delta=DELTA,
+    T_slots=T_SLOTS,
     T_decision=T_DECISION,
     T_drain=T_DRAIN,
     seed=GLOBAL_SEED
 )
 
+# Agent base ranges (lam_sec_min/max overridden per-scenario)
+AGENT_CFG = CFG["agents"]
+SC_LIGHT  = CFG["scenarios"]["light"]
+SC_MOD    = CFG["scenarios"]["moderate"]
+SC_HEAVY  = CFG["scenarios"]["heavy"]
+
 BASE_AGENT_RANGES = AgentRanges(
-    lam_sec_min=0.02, lam_sec_max=0.80,
-    f_local_min=0.8e9, f_local_max=2.4e9,
-    m_local_min=3e3,  m_local_max=8e3  # MB
+    lam_sec_min=SC_LIGHT["lam_sec_min"],   # base placeholder; overridden for each scenario
+    lam_sec_max=SC_HEAVY["lam_sec_max"],   # base placeholder
+    f_local_min=AGENT_CFG["f_local_min"],
+    f_local_max=AGENT_CFG["f_local_max"],
+    m_local_min=AGENT_CFG["m_local_min"],
+    m_local_max=AGENT_CFG["m_local_max"]
 )
+
+# Base TaskFeatureDist; scenario-specific overrides applied with replace(...)
 BASE_TASK_DIST = TaskFeatureDist()
 
 SCENARIOS: List[GlobalConfig] = [
+    # ---- LIGHT ----
     GlobalConfig(
         name="light",
-        N_agents=18,
+        N_agents=SC_LIGHT["n_agents"],
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 101),
-        AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.01, lam_sec_max=0.05),
+        AgentRanges=replace(
+            BASE_AGENT_RANGES,
+            lam_sec_min=SC_LIGHT["lam_sec_min"],
+            lam_sec_max=SC_LIGHT["lam_sec_max"]
+        ),
         TaskDist=replace(
             BASE_TASK_DIST,
-            b_median=2.0,  b_sigma_g=1.55,
-            rho_median=1.0e9, rho_sigma_g=1.45,
-            mem_median=64.0, mem_sigma_g=1.40,
-            p_deadline=0.15, deadline_min=0.8, deadline_max=2.0,
-            p_non_atomic=0.25, split_ratio_min=0.25, split_ratio_max=0.75
+            b_median=SC_LIGHT["b_median"],
+            b_sigma_g=SC_LIGHT["b_sigma_g"],
+            rho_median=SC_LIGHT["rho_median"],
+            rho_sigma_g=SC_LIGHT["rho_sigma_g"],
+            mem_median=SC_LIGHT["mem_median"],
+            mem_sigma_g=SC_LIGHT["mem_sigma_g"],
+            p_deadline=SC_LIGHT["p_deadline"],
+            deadline_min=SC_LIGHT["deadline_min"],
+            deadline_max=SC_LIGHT["deadline_max"],
+            p_non_atomic=SC_LIGHT["p_non_atomic"],
+            split_ratio_min=SC_LIGHT["split_ratio_min"],
+            split_ratio_max=SC_LIGHT["split_ratio_max"]
         )
     ),
+
+    # ---- MODERATE ----
     GlobalConfig(
         name="moderate",
-        N_agents=18,
+        N_agents=SC_MOD["n_agents"],
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 202),
-        AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.05, lam_sec_max=0.20),
+        AgentRanges=replace(
+            BASE_AGENT_RANGES,
+            lam_sec_min=SC_MOD["lam_sec_min"],
+            lam_sec_max=SC_MOD["lam_sec_max"]
+        ),
         TaskDist=replace(
             BASE_TASK_DIST,
-            b_median=3.0,  b_sigma_g=1.60,
-            rho_median=1.2e9, rho_sigma_g=1.50,
-            mem_median=64.0, mem_sigma_g=1.45,
-            p_deadline=0.25, deadline_min=0.5, deadline_max=1.5,
-            p_non_atomic=0.35, split_ratio_min=0.30, split_ratio_max=0.80
+            b_median=SC_MOD["b_median"],
+            b_sigma_g=SC_MOD["b_sigma_g"],
+            rho_median=SC_MOD["rho_median"],
+            rho_sigma_g=SC_MOD["rho_sigma_g"],
+            mem_median=SC_MOD["mem_median"],
+            mem_sigma_g=SC_MOD["mem_sigma_g"],
+            p_deadline=SC_MOD["p_deadline"],
+            deadline_min=SC_MOD["deadline_min"],
+            deadline_max=SC_MOD["deadline_max"],
+            p_non_atomic=SC_MOD["p_non_atomic"],
+            split_ratio_min=SC_MOD["split_ratio_min"],
+            split_ratio_max=SC_MOD["split_ratio_max"]
         )
     ),
+
+    # ---- HEAVY ----
     GlobalConfig(
         name="heavy",
-        N_agents=18,
+        N_agents=SC_HEAVY["n_agents"],
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 303),
-        AgentRanges=replace(BASE_AGENT_RANGES, lam_sec_min=0.20, lam_sec_max=0.80),
+        AgentRanges=replace(
+            BASE_AGENT_RANGES,
+            lam_sec_min=SC_HEAVY["lam_sec_min"],
+            lam_sec_max=SC_HEAVY["lam_sec_max"]
+        ),
         TaskDist=replace(
             BASE_TASK_DIST,
-            b_median=5.0,  b_sigma_g=1.70,
-            rho_median=1.5e9, rho_sigma_g=1.55,
-            mem_median=64.0, mem_sigma_g=1.50,
-            p_deadline=0.35, deadline_min=0.3, deadline_max=1.0,
-            p_non_atomic=0.45, split_ratio_min=0.40, split_ratio_max=0.85
+            b_median=SC_HEAVY["b_median"],
+            b_sigma_g=SC_HEAVY["b_sigma_g"],
+            rho_median=SC_HEAVY["rho_median"],
+            rho_sigma_g=SC_HEAVY["rho_sigma_g"],
+            mem_median=SC_HEAVY["mem_median"],
+            mem_sigma_g=SC_HEAVY["mem_sigma_g"],
+            p_deadline=SC_HEAVY["p_deadline"],
+            deadline_min=SC_HEAVY["deadline_min"],
+            deadline_max=SC_HEAVY["deadline_max"],
+            p_non_atomic=SC_HEAVY["p_non_atomic"],
+            split_ratio_min=SC_HEAVY["split_ratio_min"],
+            split_ratio_max=SC_HEAVY["split_ratio_max"]
         )
-    )
+    ),
 ]
 
-# -------------------------
+
+# ============================================================
 # drivers: per-scenario & all-scenarios
-# -------------------------
+# ============================================================
+
 def main_generate_for_scenario(
     cfg: GlobalConfig,
     agents: List[Agent],
@@ -623,6 +741,7 @@ def main_generate_for_scenario(
 
     return paths
 
+
 def generate_all_scenarios(
     episodes_each: int = 1,
     out_root: str = "./datasets",
@@ -637,7 +756,7 @@ def generate_all_scenarios(
     with info for ALL scenarios.
 
     NOTE:
-      - To fully mimic HOODIE training (5000 episodes), call:
+      - To fully mimic HOODIE training (e.g., many episodes), call:
             generate_all_scenarios(episodes_each=5000, ...)
       - Default episodes_each=1 is for debugging.
     """
@@ -676,9 +795,11 @@ def generate_all_scenarios(
 
     return results
 
-# -------------------------
+
+# ============================================================
 # sanity checks
-# -------------------------
+# ============================================================
+
 def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
     """
     Lightweight sanity checks for one ep_xxx:
@@ -758,9 +879,9 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
         if ((tasks_df["split_ratio"] < 0) | (tasks_df["split_ratio"] > 1)).any():
             print(f"    [WARN] split_ratio out of [0,1] range in '{scen}'")
         # non_atomic=0 => split_ratio==0
-        non_atomic_zero = tasks_df["non_atomic"] == 0
-        if (tasks_df.loc[non_atomic_zero, "split_ratio"] != 0).any():
-            print(f"    [WARN] non_atomic==0 but split_ratio != 0 in '{scen}'")
+        mask = tasks_df["non_atomic"] == 0
+        if (~np.isclose(tasks_df.loc[mask, "split_ratio"], 0.0)).any():
+            print(f"    [WARN] non_atomic==0 but split_ratio != 0 (float mismatch) in '{scen}'")
 
         # 5) rough lambda consistency check (using decision horizon length)
         if len(episodes_df):
@@ -782,6 +903,7 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
                     print(f"    [INFO] Poisson check: some agents have realized rate far from expected "
                           f"(too_low={too_low}, too_high={too_high}) in '{scen}'")
 
+
 def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
     """
     Run sanity checks over all ep_* folders under out_root.
@@ -800,16 +922,20 @@ def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
         if os.path.isdir(ep_dir):
             sanity_check_episode(ep_dir, scenario_names)
 
-# -------------------------
+
+# ============================================================
 # main
-# -------------------------
+# ============================================================
+
 if __name__ == "__main__":
-    out_root = "./datasets"
-    # For testing: 1 episode; to get closer to the original HOODIE:
-    #   generate_all_scenarios(episodes_each=5000, ...)
-    results = generate_all_scenarios(episodes_each=1, out_root=out_root, qcap=0.99)
+    # Use dataset config from JSON
+    results = generate_all_scenarios(
+        episodes_each=DATASET_EPISODES_EACH,
+        out_root=DATASET_OUT_ROOT,
+        qcap=DATASET_QCAP
+    )
     print(json.dumps(results, indent=2))
 
     # basic sanity checks
     scenario_names = [cfg.name for cfg in SCENARIOS]
-    sanity_check_root(out_root, scenario_names=scenario_names)
+    sanity_check_root(DATASET_OUT_ROOT, scenario_names=scenario_names)

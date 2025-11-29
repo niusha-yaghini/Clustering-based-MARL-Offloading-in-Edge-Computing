@@ -1,30 +1,21 @@
-# -*- coding: utf-8 -*-
-"""
-HOODIE–style Topology Builder (enhanced, 3 variants)
-- Separate private/public capacities (not merged)
-- Connection matrix: shape (K, K+1), last column = MEC→Cloud
-- Styles: 'fully_connected' | 'skip_connections' (k-nearest ring) | 'clustered'
-- Inputs per-second -> scaled by Delta to per-slot (HOODIE-compatible)
-
-Core outputs per topology: topology.json, topology_meta.json
-Extras per topology: connection_matrix.csv, topology_graph.png, topology_report.md
-
-Fixes/Improvements:
-- Enforce symmetry + zero diagonal (MEC↔MEC)
-- Add parameter asserts
-- Add hyperparameters dump to meta
-- Add link density to report
-- Optional weak inter-cluster links via inter_cluster_frac
-- Document skip_connections semantics in meta
-"""
-
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional
 import numpy as np
-import json, os, time, hashlib, platform, getpass
+import json
+import os
+import time
+import hashlib
+import platform
+import getpass
+import pandas as pd
 
-# Optional deps for graph/report
+import networkx as nx
+import matplotlib.pyplot as plt
+print("OK")
+
+
+# Optional deps (for graph)
 try:
     import networkx as nx
     import matplotlib.pyplot as plt
@@ -32,68 +23,35 @@ try:
 except Exception:
     _GRAPH_OK = False
 
-# =========================
-# Data classes
-# =========================
-@dataclass
-class TopologyHyper:
-    number_of_servers: int              # K (MEC count)
-    time_step: float                    # Δ (sec per slot)
 
-    # ----- Compute capacities (per second); scaled by Δ -> per slot
-    private_cpu_min: Optional[float] = None
-    private_cpu_max: Optional[float] = None
-    public_cpu_min: Optional[float] = None
-    public_cpu_max: Optional[float] = None
+# ============================================================
+# Utility functions
+# ============================================================
 
-    # If you don't have separate ranges, provide totals + public_share in [0,1]
-    cpu_total_min: Optional[float] = None
-    cpu_total_max: Optional[float] = None
-    public_share: Optional[float] = None
-
-    # Cloud capacity (per second) — fixed or range
-    cloud_capacity: Optional[float] = None
-    cloud_capacity_min: Optional[float] = None
-    cloud_capacity_max: Optional[float] = None
-
-    # ----- Links (per second); scaled by Δ -> per slot
-    horiz_cap_min: float = 8.0         # MB/s (MEC↔MEC)
-    horiz_cap_max: float = 12.0
-    cloud_cap_min: float = 50.0        # MB/s (MEC→Cloud)
-    cloud_cap_max: float = 200.0
-
-    # ----- Generator
-    topology_type: str = "skip_connections"  # 'fully_connected' | 'skip_connections' | 'clustered'
-    skip_k: int = 5                           # for skip_connections (k-nearest ring)
-    symmetric: bool = True
-
-    # For clustered
-    num_clusters: int = 3
-    inter_cluster_frac: float = 0.0  # fraction of horiz_cap_min for weak inter-cluster links (0.0 => none)
-
-    # ----- RNG
-    seed: int = 2025
-
-# =========================
-# Utils
-# =========================
 def _fp(obj: dict) -> str:
+    """Compute a short fingerprint for a dictionary."""
     s = json.dumps(obj, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
 
+
 def _save_json(obj: dict, path: str) -> str:
+    """Save a dictionary as pretty-printed JSON."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     return path
 
+
 def _save_text(text: str, path: str) -> str:
+    """Save plain text to a file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path
 
+
 def _save_matrix_csv(M: np.ndarray, path: str) -> str:
+    """Save connection matrix as a CSV with MEC labels and a cloud column."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     K = M.shape[0]
     header = [f"mec_{i}" for i in range(K)] + ["cloud"]
@@ -105,163 +63,177 @@ def _save_matrix_csv(M: np.ndarray, path: str) -> str:
         f.write("\n".join(lines))
     return path
 
-# =========================
-# Validations
-# =========================
-def _validate_h(h: TopologyHyper) -> None:
-    assert h.number_of_servers > 0 and h.time_step > 0
-    assert h.horiz_cap_max >= h.horiz_cap_min and h.cloud_cap_max >= h.cloud_cap_min
-    if h.private_cpu_min is not None:
-        assert h.private_cpu_max is not None and h.private_cpu_max >= h.private_cpu_min
-        assert h.public_cpu_min  is not None and h.public_cpu_max  is not None and h.public_cpu_max >= h.public_cpu_min
-    if h.cpu_total_min is not None:
-        assert h.cpu_total_max is not None and h.cpu_total_max >= h.cpu_total_min
-        share = h.public_share if h.public_share is not None else 0.3
-        assert 0.0 <= share <= 1.0
-    assert h.num_clusters >= 1
-    assert h.inter_cluster_frac >= 0.0
 
-# =========================
-# Builders: compute & cloud
-# =========================
-def _sample_cloud_capacity(h: TopologyHyper, rng: np.random.Generator) -> float:
-    if h.cloud_capacity is not None:
-        return float(h.cloud_capacity)
-    if h.cloud_capacity_min is not None and h.cloud_capacity_max is not None:
-        return float(rng.uniform(h.cloud_capacity_min, h.cloud_capacity_max))
-    return 3.0e10  # fallback per-second
+# ============================================================
+# Data classes (TopologyHyper)
+# ============================================================
 
-def _build_compute_caps(h: TopologyHyper, rng: np.random.Generator) -> Tuple[List[float], List[float]]:
-    K = h.number_of_servers
-    if (h.private_cpu_min is not None and h.private_cpu_max is not None and
-        h.public_cpu_min  is not None and h.public_cpu_max  is not None):
-        priv_sec = rng.uniform(h.private_cpu_min, h.private_cpu_max, size=K)
-        pub_sec  = rng.uniform(h.public_cpu_min,  h.public_cpu_max,  size=K)
-    else:
-        tot_sec  = rng.uniform(float(h.cpu_total_min or 2.0e9),
-                               float(h.cpu_total_max or 3.0e9),
-                               size=K)
-        share = float(h.public_share if h.public_share is not None else 0.3)
-        pub_sec  = tot_sec * share
-        priv_sec = tot_sec - pub_sec
+@dataclass
+class TopologyHyper:
+    """
+    Hyperparameters for topology generation.
+    MEC / Cloud compute capacities are loaded from environment files,
+    so this class only stores structural and link-level parameters.
+    """
 
-    priv_slot = (priv_sec * h.time_step).astype(float).tolist()
-    pub_slot  = (pub_sec  * h.time_step).astype(float).tolist()
-    return priv_slot, pub_slot
+    time_step: float
 
-# =========================
-# Builders: connection matrix
-# =========================
-def _set_vertical_mec_to_cloud(M: np.ndarray, h: TopologyHyper, rng: np.random.Generator) -> None:
-    K = h.number_of_servers
-    for i in range(K):
-        cap_sec = rng.uniform(h.cloud_cap_min, h.cloud_cap_max)
-        M[i, K] = float(cap_sec * h.time_step)
+    # Link bandwidths (to be provided as inputs by the user)
+    bw_mec_mec: float = 3.0   # MEC↔MEC bandwidth
+    bw_mec_cloud: float = 5.0 # MEC→Cloud bandwidth
 
-def _build_connection_matrix_fully_connected(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
-    K = h.number_of_servers
+    # Topology structure
+    topology_type: str = "skip_connections"  # fully_connected | clustered | skip_connections
+    skip_k: int = 3                          # used in skip_connections (k-nearest ring)
+    symmetric: bool = True
+    num_clusters: int = 3
+    inter_cluster_frac: float = 0.0          # for weak inter-cluster links in clustered topology
+
+    # Optional: store environment CSV paths (not strictly required for logic)
+    environment_mec_file: Optional[str] = None
+    environment_cloud_file: Optional[str] = None
+
+    seed: int = 2025
+
+
+# ============================================================
+# Reading MEC / Cloud data
+# ============================================================
+
+def read_environment_files(mec_file: str, cloud_file: str):
+    """
+    Read MEC and Cloud capacities from CSV files.
+    Expected columns:
+      - MEC CSV: 'Private CPU Capacity', 'Public CPU Capacity'
+      - Cloud CSV: 'computational_capacity'
+    """
+    
+    
+    print("inside read_environment_files")
+    mec_df = pd.read_csv(mec_file)
+    cloud_df = pd.read_csv(cloud_file)
+
+    num_mec = len(mec_df)
+    private_caps = mec_df["Private CPU Capacity"].tolist()
+    public_caps = mec_df["Public CPU Capacity"].tolist()
+
+    cloud_cap = float(cloud_df["computational_capacity"].iloc[0])
+
+    return num_mec, private_caps, public_caps, cloud_cap
+
+
+# ============================================================
+# Build Connection Matrix
+# ============================================================
+
+def _build_connection_matrix(h: TopologyHyper, K: int) -> np.ndarray:
+    """
+    Build connection matrix of shape (K, K+1):
+
+    - Columns 0..K-1  : MEC↔MEC horizontal links
+    - Column K        : MEC→Cloud vertical links
+
+    Link capacities are NOT random here:
+    - MEC↔MEC links use h.bw_mec_mec
+    - MEC→Cloud links use h.bw_mec_cloud
+    """
+    
+    print("inside _build_connection_matrix")
+
+    # Initialize matrix with zeros
     M = np.zeros((K, K + 1), dtype=float)
-    _set_vertical_mec_to_cloud(M, h, rng)
 
-    # fill upper-triangular, then mirror for symmetry
-    for i in range(K):
-        for j in range(i + 1, K):
-            cap_sec = rng.uniform(h.horiz_cap_min, h.horiz_cap_max)
-            cap_slot = float(cap_sec * h.time_step)
-            M[i, j] = cap_slot
-            M[j, i] = cap_slot  # symmetric
-    return M
+    # Read bandwidth parameters from hyper
+    bw_mm = float(h.bw_mec_mec)     # MEC↔MEC bandwidth
+    bw_mc = float(h.bw_mec_cloud)   # MEC→Cloud bandwidth
 
-def _build_connection_matrix_skip_connections(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
-    """
-    k-nearest ring on a circular index: each node connects to next 'skip_k' neighbors.
-    """
-    K = h.number_of_servers
-    M = np.zeros((K, K + 1), dtype=float)
-    _set_vertical_mec_to_cloud(M, h, rng)
+    # ---------------------------
+    # Horizontal MEC↔MEC links
+    # ---------------------------
+    if h.topology_type == "fully_connected":
+        # Fully connected: all MECs interconnected
+        for i in range(K):
+            for j in range(i + 1, K):
+                M[i, j] = bw_mm
+                if h.symmetric:
+                    M[j, i] = bw_mm
 
-    step = max(1, int(h.skip_k))
-    for i in range(K):
-        for s in range(1, step + 1):
-            j = (i + s) % K
-            if i == j:
-                continue
-            cap_sec = rng.uniform(h.horiz_cap_min, h.horiz_cap_max)
-            cap_slot = float(cap_sec * h.time_step)
-            M[i, j] = cap_slot
-            if h.symmetric:
-                M[j, i] = cap_slot
-    return M
+    elif h.topology_type == "skip_connections":
+        # k-nearest ring
+        step = max(1, int(h.skip_k))
+        for i in range(K):
+            for s in range(1, step + 1):
+                j = (i + s) % K
+                if i == j:
+                    continue
+                M[i, j] = bw_mm
+                if h.symmetric:
+                    M[j, i] = bw_mm
 
-def _build_connection_matrix_clustered(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
-    """
-    Clustered = several clusters with fully-connected intra-cluster links (symmetric),
-    and zero/weak inter-cluster connections controlled by inter_cluster_frac.
-    """
-    K = h.number_of_servers
-    C = max(1, int(h.num_clusters))
-    M = np.zeros((K, K + 1), dtype=float)
-    _set_vertical_mec_to_cloud(M, h, rng)
+    elif h.topology_type == "clustered":
+        # Clustered topology: fully connected inside clusters
+        C = max(1, int(h.num_clusters))
 
-    # Divide K into C clusters with approximately equal sizes
-    sizes = [K // C] * C
-    for i in range(K % C):
-        sizes[i] += 1
-    starts = np.cumsum([0] + sizes[:-1])
-    clusters = [(int(s), int(s + sz)) for s, sz in zip(starts, sizes)]  # [(start, end), ...]
+        # Compute cluster sizes
+        sizes = [K // C] * C
+        for idx in range(K % C):
+            sizes[idx] += 1
+        starts = np.cumsum([0] + sizes[:-1])
+        clusters = [(int(s), int(s + sz)) for s, sz in zip(starts, sizes)]  # [(start, end), ...]
 
-    # Fully connected and symmetric links within each cluster
-    for (a, b) in clusters:
-        for i in range(a, b):
-            for j in range(i + 1, b):
-                cap_sec = rng.uniform(h.horiz_cap_min, h.horiz_cap_max)
-                cap_slot = float(cap_sec * h.time_step)
-                M[i, j] = cap_slot
-                M[j, i] = cap_slot
+        # Intra-cluster links (fully connected)
+        for (a, b) in clusters:
+            for i in range(a, b):
+                for j in range(i + 1, b):
+                    M[i, j] = bw_mm
+                    if h.symmetric:
+                        M[j, i] = bw_mm
 
-    # Weak inter-cluster links if requested
-    if h.inter_cluster_frac > 0.0:
-        weak = float(h.horiz_cap_min * h.inter_cluster_frac * h.time_step)
-        for c1 in range(len(clusters)):
-            for c2 in range(c1 + 1, len(clusters)):
-                a1, b1 = clusters[c1]
-                a2, b2 = clusters[c2]
-                i = a1   # representative node of cluster 1
-                j = a2   # representative node of cluster 2
-                if i != j:
+        # Optional weak inter-cluster links
+        if h.inter_cluster_frac > 0.0:
+            weak = bw_mm * float(h.inter_cluster_frac)
+            for c1 in range(len(clusters)):
+                for c2 in range(c1 + 1, len(clusters)):
+                    a1, b1 = clusters[c1]
+                    a2, b2 = clusters[c2]
+                    i = a1   # representative node of cluster 1
+                    j = a2   # representative node of cluster 2
+                    if i == j:
+                        continue
                     M[i, j] = max(M[i, j], weak)
                     if h.symmetric:
                         M[j, i] = max(M[j, i], weak)
 
-    return M
-
-def _build_connection_matrix(h: TopologyHyper, rng: np.random.Generator) -> np.ndarray:
-    if h.topology_type == "fully_connected":
-        M = _build_connection_matrix_fully_connected(h, rng)
-    elif h.topology_type == "clustered":
-        M = _build_connection_matrix_clustered(h, rng)
     else:
-        M = _build_connection_matrix_skip_connections(h, rng)
+        # Unknown topology_type → no horizontal links
+        pass
 
-    K = h.number_of_servers
-    if h.symmetric:
-        M[:, :K] = np.maximum(M[:, :K], M[:, :K].T)
-    np.fill_diagonal(M[:, :K], 0.0)
+    # Ensure zero diagonal for MEC↔MEC
+    for i in range(K):
+        M[i, i] = 0.0
+
+    # ---------------------------
+    # Vertical MEC→Cloud links
+    # ---------------------------
+    for i in range(K):
+        M[i, K] = bw_mc
+
     return M
 
-# =========================
-# Graph drawing (optional)
-# =========================
+
+# ============================================================
+# Graph drawing
+# ============================================================
+
 def _draw_graph_png(M: np.ndarray,
                     out_png: str,
                     title: str = "MEC Graph (MB/slot)",
                     with_cloud: bool = True):
+    """Draw a simple network graph of MECs and Cloud and save as PNG."""
     if not _GRAPH_OK:
         return None
 
     K = M.shape[0]
-    import networkx as nx
-    import matplotlib.pyplot as plt
 
     G = nx.Graph()
 
@@ -269,17 +241,17 @@ def _draw_graph_png(M: np.ndarray,
     for i in range(K):
         G.add_node(f"MEC_{i}", layer="mec")
 
-    # MEC↔MEC edges (only upper triangle to avoid duplicates)
+    # MEC↔MEC edges
     for i in range(K):
         for j in range(i + 1, K):
             cap = max(M[i, j], M[j, i])
             if cap > 0:
                 G.add_edge(f"MEC_{i}", f"MEC_{j}", weight=cap)
 
-    # Positions: circular for MEC
+    # Layout for MEC nodes
     pos = nx.circular_layout([f"MEC_{i}" for i in range(K)])
 
-    # Optionally add cloud
+    # Optional cloud node
     if with_cloud:
         G.add_node("CLOUD", layer="cloud")
         pos["CLOUD"] = np.array([0.0, 1.25])
@@ -288,22 +260,19 @@ def _draw_graph_png(M: np.ndarray,
             if cap_cloud > 0:
                 G.add_edge(f"MEC_{i}", "CLOUD", weight=cap_cloud)
 
-    # Draw
     plt.figure(figsize=(7, 7))
-    nx.draw_networkx_nodes(G, pos, nodelist=[n for n, d in G.nodes(data=True) if d.get("layer")=="mec"])
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=[n for n, d in G.nodes(data=True) if d.get("layer") == "mec"]
+    )
     if with_cloud:
         nx.draw_networkx_nodes(G, pos, nodelist=["CLOUD"], node_shape="s")
 
-    edges_mm = [(u,v) for u,v in G.edges() if "CLOUD" not in (u,v)]
-    nx.draw_networkx_edges(G, pos, edgelist=edges_mm)
+    nx.draw_networkx_edges(G, pos)
+    nx.draw_networkx_labels(G, pos)
 
-    edges_mc = [(u,v) for u,v in G.edges() if "CLOUD" in (u,v)]
-    nx.draw_networkx_edges(G, pos, edgelist=edges_mc, style="dashed")
-
-    nx.draw_networkx_labels(G, pos, font_size=9)
-
-    edge_labels = {(u,v): f"{G[u][v]['weight']:.1f}" for u,v in G.edges()}
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+    edge_labels = {(u, v): f"{G[u][v]['weight']:.1f}" for u, v in G.edges()}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels)
 
     plt.title(title)
     plt.axis("off")
@@ -313,101 +282,107 @@ def _draw_graph_png(M: np.ndarray,
     plt.close()
     return out_png
 
-# =========================
-# Report (Markdown)
-# =========================
+
+# ============================================================
+# Markdown Report Writer
+# ============================================================
+
 def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out_md: str):
+    """Write a simple Markdown report summarizing the topology."""
     K = topo["number_of_servers"]
-    units = meta.get("units", {})
-    compute_unit = units.get("compute", "CPU cycles per slot")
-    link_unit = units.get("links", "MB per slot")
-    time_unit = units.get("time_step", "seconds")
-
     priv = topo["private_cpu_capacities"]
-    pub  = topo["public_cpu_capacities"]
+    pub = topo["public_cpu_capacities"]
     cloud = topo["cloud_computational_capacity"]
-
-    def s(lst):
-        if not lst: return "n/a"
-        arr = np.array(lst, dtype=float)
-        return f"min={arr.min():.3g}, mean={arr.mean():.3g}, max={arr.max():.3g}"
 
     M = np.array(topo["connection_matrix"], dtype=float)
     horiz = M[:, :K]
-    vert  = M[:, K]
+    vert = M[:, K]
+
     nonzero = int((horiz > 0).sum())
     density = nonzero / float(K * (K - 1)) if K > 1 else 0.0
+
+    hyper = meta.get("hyperparameters", {})
+    bw_mm = hyper.get("bw_mec_mec", "n/a")
+    bw_mc = hyper.get("bw_mec_cloud", "n/a")
 
     md = []
     md.append(f"# Topology Report\n")
     md.append(f"- **Servers (MEC)**: {K}")
-    md.append(f"- **Time step (Δ)**: {topo['time_step']} {time_unit}")
-    md.append(f"- **Topology type**: {topo.get('topology_type','n/a')}, "
-              f"**skip_k**: {topo.get('skip_k','-')}, **symmetric**: {topo.get('symmetric','-')}, "
-              f"**num_clusters**: {topo.get('num_clusters','-')}")
+    md.append(f"- **Topology type**: {topo['topology_type']}")
+    md.append(f"- **Link density (MEC↔MEC)**: {density:.3f}")
     md.append("")
-    md.append(f"## Compute Capacities ({compute_unit})")
-    md.append(f"- Private (per MEC): {s(priv)}")
-    md.append(f"- Public  (per MEC): {s(pub)}")
-    md.append(f"- Cloud (single): {cloud:.3g}")
+    md.append(f"## Compute Capacities")
+    md.append(f"- Private: {priv}")
+    md.append(f"- Public:  {pub}")
+    md.append(f"- Cloud:   {cloud}")
     md.append("")
-    md.append(f"## Link Capacities ({link_unit})")
-    md.append(f"- Horizontal MEC↔MEC (non-zero entries): {nonzero} (density={density:.3f})")
-    md.append(f"- MEC→Cloud (length K): min={vert.min():.3g}, mean={vert.mean():.3g}, max={vert.max():.3g}")
+    md.append(f"## Link Capacities")
+    md.append(f"- MEC↔MEC bandwidth: {bw_mm}")
+    md.append(f"- MEC→Cloud bandwidth: {bw_mc}")
+    md.append(f"- MEC→Cloud stats: min={vert.min():.3g}, mean={vert.mean():.3g}, max={vert.max():.3g}")
     md.append("")
     if graph_png:
         md.append(f"## Graph")
         md.append(f"![Topology Graph]({os.path.basename(graph_png)})")
         md.append("")
-    md.append("## Notes")
-    md.append("- Values are per slot; per-slot = per-second × Δ.")
-    md.append(f"- Units: compute={compute_unit}, links={link_unit}, time_step={time_unit}.")
-    md_txt = "\n".join(md)
-    _save_text(md_txt, out_md)
+
+    _save_text("\n".join(md), out_md)
     return out_md
 
-# =========================
+
+# ============================================================
 # Main builder
-# =========================
-def build_topology(h: TopologyHyper,
-                   out_topology: str = "./topology/topology.json",
-                   out_meta: str = "./topology/topology_meta.json") -> Dict[str, str]:
-    _validate_h(h)
-    rng = np.random.default_rng(h.seed)
+# ============================================================
 
-    private_caps, public_caps = _build_compute_caps(h, rng)
-    cloud_cap_sec = _sample_cloud_capacity(h, rng)
-    cloud_cap = float(cloud_cap_sec * h.time_step)  # per-slot
+def build_topology(
+    h: TopologyHyper,
+    mec_csv_path: str,
+    cloud_csv_path: str,
+    out_topology: str = "./topology/topology.json",
+    out_meta: str = "./topology/topology_meta.json"
+) -> Dict[str, str]:
+    """
+    Build a single topology using:
+      - MEC / Cloud capacities from CSV
+      - structural parameters from TopologyHyper
+    """
 
-    M = _build_connection_matrix(h, rng)
+    
+    print("inside build_topology")
+    # Optional RNG in case you later want stochastic behaviors
+    _ = np.random.default_rng(h.seed)
 
+    # STEP 1 — Read MEC + Cloud data
+    K, private_caps, public_caps, cloud_cap = read_environment_files(
+        mec_csv_path, cloud_csv_path
+    )
+
+    # STEP 2 — Build connection matrix
+    M = _build_connection_matrix(h, K)
+
+    # STEP 3 — Construct topology dict
     topo = {
-        "number_of_servers": h.number_of_servers,
-        "private_cpu_capacities": private_caps,     # cycles/slot
-        "public_cpu_capacities": public_caps,       # cycles/slot
-        "cloud_computational_capacity": cloud_cap,  # cycles/slot
-        "connection_matrix": M.tolist(),            # MB/slot
+        "number_of_servers": K,
+        "private_cpu_capacities": private_caps,
+        "public_cpu_capacities": public_caps,
+        "cloud_computational_capacity": cloud_cap,
+        "connection_matrix": M.tolist(),
         "time_step": h.time_step,
         "topology_type": h.topology_type,
         "skip_k": h.skip_k,
         "symmetric": h.symmetric,
         "num_clusters": h.num_clusters
     }
+
+    # Meta info
     meta = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "fingerprint": _fp(topo),
         "env": {"python": platform.python_version(), "user": getpass.getuser()},
-        "units": {"compute": "CPU cycles per slot", "links": "MB per slot", "time_step": "seconds"},
-        "notes": {
-            "inputs_unit": {"compute": "CPU cycles per second", "links": "MB per second"},
-            "conversion": "per_slot = per_second * time_step",
-            "topology_semantics": {
-                "skip_connections": "k-nearest ring; each MEC connects to next 'skip_k' neighbors on a circle"
-            }
-        },
-        "hyperparameters": asdict(h)
+        "hyperparameters": asdict(h),
     }
 
+    # Save data
     _save_json(topo, out_topology)
     _save_json(meta, out_meta)
 
@@ -415,14 +390,17 @@ def build_topology(h: TopologyHyper,
     cm_csv = os.path.join(out_dir, "connection_matrix.csv")
     _save_matrix_csv(M, cm_csv)
 
+    # Optional Graph
     graph_png = None
     if _GRAPH_OK:
         graph_png = os.path.join(out_dir, "topology_graph.png")
-        _draw_graph_png(M, graph_png, title="MEC Graph (MB/slot)", with_cloud=True)
+        _draw_graph_png(M, graph_png, with_cloud=True)
 
+    # Markdown report
     report_md = os.path.join(out_dir, "topology_report.md")
     _write_markdown_report(topo, meta, graph_png, report_md)
 
+    print("inside build_topology after savings")
     return {
         "topology_json": out_topology,
         "meta_json": out_meta,
@@ -431,160 +409,85 @@ def build_topology(h: TopologyHyper,
         "report_md": report_md
     }
 
-# =========================
-# Build from JSON hyperparams (optional)
-# =========================
-def build_from_hyperparameters_json(hparams_path: str,
-                                    out_dir: str = "./topology") -> Dict[str, str]:
-    with open(hparams_path, "r", encoding="utf-8") as f:
-        hp = json.load(f)
 
-    th = TopologyHyper(
-        number_of_servers = int(hp.get("number_of_servers", 18)),
-        time_step         = float(hp.get("time_step", 1.0)),
-        private_cpu_min   = hp.get("private_cpu_min"),
-        private_cpu_max   = hp.get("private_cpu_max"),
-        public_cpu_min    = hp.get("public_cpu_min"),
-        public_cpu_max    = hp.get("public_cpu_max"),
-        cpu_total_min     = hp.get("cpu_total_min"),
-        cpu_total_max     = hp.get("cpu_total_max"),
-        public_share      = hp.get("public_share"),
-        cloud_capacity    = hp.get("cloud_capacity"),
-        cloud_capacity_min= hp.get("cloud_capacity_min"),
-        cloud_capacity_max= hp.get("cloud_capacity_max"),
-        horiz_cap_min     = float(hp.get("horizontal_capacities_min", 8.0)),
-        horiz_cap_max     = float(hp.get("horizontal_capacities_max", 12.0)),
-        cloud_cap_min     = float(hp.get("cloud_capacities_min", 50.0)),
-        cloud_cap_max     = float(hp.get("cloud_capacities_max", 200.0)),
-        topology_type     = hp.get("topology_type", "skip_connections"),
-        skip_k            = int(hp.get("skip_k", 5)),
-        symmetric         = bool(hp.get("symmetric", True)),
-        num_clusters      = int(hp.get("num_clusters", 3)),
-        inter_cluster_frac= float(hp.get("inter_cluster_frac", 0.0)),
-        seed              = int(hp.get("seed", 2025))
-    )
+# ============================================================
+# Build multiple variants
+# ============================================================
 
-    os.makedirs(out_dir, exist_ok=True)
-    return build_topology(
-        th,
-        out_topology=os.path.join(out_dir, "topology.json"),
-        out_meta=os.path.join(out_dir, "topology_meta.json")
-    )
-
-# =========================
-# Build 3 fixed, reproducible topologies (variants)
-# =========================
 def build_three_topologies_variants(
-    K: int,
+    mec_csv_path: str,
+    cloud_csv_path: str,
     delta: float,
     seed_base: int,
+    bw_mec_mec: float,
+    bw_mec_cloud: float,
     out_root: str = "./topologies",
-    # Compute (per-second)
-    private_cpu_min: float | None = 1.2e9,
-    private_cpu_max: float | None = 1.8e9,
-    public_cpu_min:  float | None = 0.5e9,
-    public_cpu_max:  float | None = 0.9e9,
-    cpu_total_min:   float | None = None,
-    cpu_total_max:   float | None = None,
-    public_share:    float | None = None,
-    # Cloud (per-second)
-    cloud_capacity: float | None = 3.0e10,
-    cloud_capacity_min: float | None = None,
-    cloud_capacity_max: float | None = None,
-    # Links (per-second, MB/s)
-    horiz_cap_min: float = 8.0,
-    horiz_cap_max: float = 12.0,
-    cloud_cap_min: float = 80.0,
-    cloud_cap_max: float = 120.0,
-    # Cluster params
-    num_clusters: int = 3,
-    inter_cluster_frac: float = 0.0,
-):
+) -> Dict[str, Dict[str, str]]:
+    """
+    Build three topologies (fully_connected, clustered, skip_connections)
+    using the same MEC/Cloud environment and link bandwidths.
+    """
+
     os.makedirs(out_root, exist_ok=True)
+    print("inside build_three_topologies_variants")
 
-    variants = [
-        dict(
-            name="full_mesh",
-            h=TopologyHyper(
-                number_of_servers=K, time_step=delta,
-                private_cpu_min=private_cpu_min, private_cpu_max=private_cpu_max,
-                public_cpu_min=public_cpu_min,   public_cpu_max=public_cpu_max,
-                cpu_total_min=cpu_total_min, cpu_total_max=cpu_total_max, public_share=public_share,
-                cloud_capacity=cloud_capacity,
-                cloud_capacity_min=cloud_capacity_min, cloud_capacity_max=cloud_capacity_max,
-                horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
-                cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
-                topology_type="fully_connected", skip_k=1, symmetric=True,
-                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
-                seed=seed_base + 101
-            )
-        ),
-        dict(
-            name="clustered",
-            h=TopologyHyper(
-                number_of_servers=K, time_step=delta,
-                private_cpu_min=private_cpu_min, private_cpu_max=private_cpu_max,
-                public_cpu_min=public_cpu_min,   public_cpu_max=public_cpu_max,
-                cpu_total_min=cpu_total_min, cpu_total_max=cpu_total_max, public_share=public_share,
-                cloud_capacity=cloud_capacity,
-                cloud_capacity_min=cloud_capacity_min, cloud_capacity_max=cloud_capacity_max,
-                horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
-                cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
-                topology_type="clustered", symmetric=True,
-                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
-                seed=seed_base + 202
-            )
-        ),
-        dict(
-            name="sparse_ring",
-            h=TopologyHyper(
-                number_of_servers=K, time_step=delta,
-                private_cpu_min=private_cpu_min, private_cpu_max=private_cpu_max,
-                public_cpu_min=public_cpu_min,   public_cpu_max=public_cpu_max,
-                cpu_total_min=cpu_total_min, cpu_total_max=cpu_total_max, public_share=public_share,
-                cloud_capacity=cloud_capacity,
-                cloud_capacity_min=cloud_capacity_min, cloud_capacity_max=cloud_capacity_max,
-                horiz_cap_min=horiz_cap_min, horiz_cap_max=horiz_cap_max,
-                cloud_cap_min=cloud_cap_min, cloud_cap_max=cloud_cap_max,
-                topology_type="skip_connections", skip_k=1, symmetric=True,  # ring
-                num_clusters=num_clusters, inter_cluster_frac=inter_cluster_frac,
-                seed=seed_base + 303
-            )
-        ),
-    ]
-
+    variants = ["fully_connected", "clustered", "skip_connections"]
     results: Dict[str, Dict[str, str]] = {}
-    for v in variants:
-        name = v["name"]
-        h: TopologyHyper = v["h"]
-        out_dir = os.path.join(out_root, name)
+
+    for idx, topo_type in enumerate(variants):
+        h = TopologyHyper(
+            time_step=delta,
+            topology_type=topo_type,
+            skip_k=3,
+            symmetric=True,
+            num_clusters=3,
+            bw_mec_mec=bw_mec_mec,
+            bw_mec_cloud=bw_mec_cloud,
+            environment_mec_file=mec_csv_path,
+            environment_cloud_file=cloud_csv_path,
+            seed=seed_base + idx * 100
+        )
+
+        out_dir = os.path.join(out_root, topo_type)
         os.makedirs(out_dir, exist_ok=True)
+
         paths = build_topology(
             h,
+            mec_csv_path=mec_csv_path,
+            cloud_csv_path=cloud_csv_path,
             out_topology=os.path.join(out_dir, "topology.json"),
             out_meta=os.path.join(out_dir, "topology_meta.json")
         )
-        results[name] = paths
+
+        results[topo_type] = paths
 
     return results
 
-# =========================
-# Example multi-build run
-# =========================
-if __name__ == "__main__":
-    K = 18
-    DELTA = 1.0
-    SEED_BASE = 20251027
 
-    out = build_three_topologies_variants(
-        K=K, delta=DELTA, seed_base=SEED_BASE,
-        private_cpu_min=1.2e9, private_cpu_max=1.8e9,
-        public_cpu_min=0.5e9,  public_cpu_max=0.9e9,
-        cloud_capacity=3.0e10,
-        horiz_cap_min=8.0, horiz_cap_max=12.0,
-        cloud_cap_min=80.0, cloud_cap_max=120.0,
-        num_clusters=3, inter_cluster_frac=0.0,
+# ============================================================
+# Example entrypoint (optional)
+# ============================================================
+
+if __name__ == "__main__":
+    print("hi")
+    # Example usage (you can adjust paths and parameters as needed)
+    mec_csv = '../Environment_Generator/simulation_output/environment.csv'
+    cloud_csv = "../Environment_Generator/simulation_output/cloud_info.csv"
+
+    # Example bandwidths (can be changed by the user)
+    bw_mm = 3.0   # MEC↔MEC
+    bw_mc = 5.0   # MEC→Cloud
+
+    delta = 1.0
+    seed_base = 20251129
+
+    out_dirs = build_three_topologies_variants(
+        mec_csv_path=mec_csv,
+        cloud_csv_path=cloud_csv,
+        delta=delta,
+        seed_base=seed_base,
+        bw_mec_mec=bw_mm,
+        bw_mec_cloud=bw_mc,
         out_root="./topologies"
     )
-    print(json.dumps(out, indent=2))
-    
+    print(json.dumps(out_dirs, indent=2))
