@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2025-11-29T13:25:59Z",
+  "fingerprint": "8803ee94d59c2a15",
+  "env": {
+    "python": "3.10.9",
+    "user": "niush"
+  },
+  "hyperparameters": {
+    "time_step": 1.0,
+    "bw_mec_mec": 3.0,
+    "bw_mec_cloud": 5.0,
+    "topology_type": "fully_connected",
+    "skip_k": 3,
+    "symmetric": true,
+    "num_clusters": 3,
+    "inter_cluster_frac": 0.0,
+    "environment_mec_file": "../Environment_Generator/simulation_output/environment.csv",
+    "environment_cloud_file": "../Environment_Generator/simulation_output/cloud_info.csv",
+    "seed": 20251129
+  }
+}
