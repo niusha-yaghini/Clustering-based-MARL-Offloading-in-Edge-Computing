@@ -1,0 +1,176 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at_utc": "2025-11-18T10:53:32Z",
+  "env": {
+    "python": "3.10.9",
+    "user": "niush"
+  },
+  "episodes_root": "d:\\Karamozi\\Meet 0.5\\Implementation\\Clustering-based-MARL-Offloading-in-Edge-Computing\\Data_Generator\\datasets\\ep_000",
+  "notes": {
+    "policy_agnostic": true,
+    "queueing": "not simulated here",
+    "timing": {
+      "description": "HOODIE-style: T_decision slots with arrivals + T_drain slots without arrivals."
+    },
+    "clipping": {
+      "enabled": true,
+      "method": "lognormal analytic quantile cap",
+      "qcap": 0.99,
+      "z_table_keys": [
+        0.9,
+        0.95,
+        0.975,
+        0.99,
+        0.995,
+        0.999
+      ]
+    },
+    "action_space_hint": "derived from non_atomic; final decision belongs to environment"
+  },
+  "scenarios": [
+    {
+      "name": "light",
+      "fingerprint": "42319969435ba9ca",
+      "Episode": {
+        "Delta": 1.0,
+        "T_slots": 110,
+        "T_decision": 100,
+        "T_drain": 10,
+        "seed": 143
+      },
+      "N_agents": 18,
+      "AgentRanges": {
+        "lam_sec_min": 0.01,
+        "lam_sec_max": 0.05,
+        "f_local_min": 800000000.0,
+        "f_local_max": 2400000000.0,
+        "m_local_min": 3000.0,
+        "m_local_max": 8000.0
+      },
+      "TaskDist": {
+        "b_median": 2.0,
+        "b_sigma_g": 1.55,
+        "rho_median": 1000000000.0,
+        "rho_sigma_g": 1.45,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.4,
+        "p_deadline": 0.15,
+        "deadline_min": 0.8,
+        "deadline_max": 2.0,
+        "p_non_atomic": 0.25,
+        "split_ratio_min": 0.25,
+        "split_ratio_max": 0.75,
+        "modality_probs": null,
+        "modality_labels": null
+      },
+      "units": {
+        "Delta": "seconds",
+        "lam_sec": "tasks per second (per agent)",
+        "per_slot_rate": "lam_sec * Delta",
+        "b_mb": "MB",
+        "rho_cyc_per_mb": "CPU cycles per MB",
+        "c_cycles": "CPU cycles",
+        "mem_mb": "MB",
+        "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
+        "f_local": "Hz",
+        "m_local": "MB"
+      }
+    },
+    {
+      "name": "moderate",
+      "fingerprint": "f0d881a348966161",
+      "Episode": {
+        "Delta": 1.0,
+        "T_slots": 110,
+        "T_decision": 100,
+        "T_drain": 10,
+        "seed": 244
+      },
+      "N_agents": 18,
+      "AgentRanges": {
+        "lam_sec_min": 0.05,
+        "lam_sec_max": 0.2,
+        "f_local_min": 800000000.0,
+        "f_local_max": 2400000000.0,
+        "m_local_min": 3000.0,
+        "m_local_max": 8000.0
+      },
+      "TaskDist": {
+        "b_median": 3.0,
+        "b_sigma_g": 1.6,
+        "rho_median": 1200000000.0,
+        "rho_sigma_g": 1.5,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.45,
+        "p_deadline": 0.25,
+        "deadline_min": 0.5,
+        "deadline_max": 1.5,
+        "p_non_atomic": 0.35,
+        "split_ratio_min": 0.3,
+        "split_ratio_max": 0.8,
+        "modality_probs": null,
+        "modality_labels": null
+      },
+      "units": {
+        "Delta": "seconds",
+        "lam_sec": "tasks per second (per agent)",
+        "per_slot_rate": "lam_sec * Delta",
+        "b_mb": "MB",
+        "rho_cyc_per_mb": "CPU cycles per MB",
+        "c_cycles": "CPU cycles",
+        "mem_mb": "MB",
+        "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
+        "f_local": "Hz",
+        "m_local": "MB"
+      }
+    },
+    {
+      "name": "heavy",
+      "fingerprint": "b4c07655801e9555",
+      "Episode": {
+        "Delta": 1.0,
+        "T_slots": 110,
+        "T_decision": 100,
+        "T_drain": 10,
+        "seed": 345
+      },
+      "N_agents": 18,
+      "AgentRanges": {
+        "lam_sec_min": 0.2,
+        "lam_sec_max": 0.8,
+        "f_local_min": 800000000.0,
+        "f_local_max": 2400000000.0,
+        "m_local_min": 3000.0,
+        "m_local_max": 8000.0
+      },
+      "TaskDist": {
+        "b_median": 5.0,
+        "b_sigma_g": 1.7,
+        "rho_median": 1500000000.0,
+        "rho_sigma_g": 1.55,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.5,
+        "p_deadline": 0.35,
+        "deadline_min": 0.3,
+        "deadline_max": 1.0,
+        "p_non_atomic": 0.45,
+        "split_ratio_min": 0.4,
+        "split_ratio_max": 0.85,
+        "modality_probs": null,
+        "modality_labels": null
+      },
+      "units": {
+        "Delta": "seconds",
+        "lam_sec": "tasks per second (per agent)",
+        "per_slot_rate": "lam_sec * Delta",
+        "b_mb": "MB",
+        "rho_cyc_per_mb": "CPU cycles per MB",
+        "c_cycles": "CPU cycles",
+        "mem_mb": "MB",
+        "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
+        "f_local": "Hz",
+        "m_local": "MB"
+      }
+    }
+  ]
+}
