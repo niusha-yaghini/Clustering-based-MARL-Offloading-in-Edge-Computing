@@ -1,0 +1,81 @@
+{
+    "global_seed": 42,
+  
+    "episode": {
+      "delta": 1.0,
+      "t_decision": 100,
+      "t_drain": 10
+    },
+  
+    "agents": {
+      "f_local_min": 800000000.0,
+      "f_local_max": 2400000000.0,
+      "m_local_min": 3000.0,
+      "m_local_max": 8000.0
+    },
+  
+    "task": {
+      "task_size_min_mb": 2,
+      "task_size_max_mb": 5
+    },
+  
+    "scenarios": {
+      "light": {
+        "lam_sec_min": 1.0,
+        "lam_sec_max": 1.0,
+        "b_median": 2.0,
+        "b_sigma_g": 1.55,
+        "rho_median": 1000000000.0,
+        "rho_sigma_g": 1.45,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.40,
+        "p_deadline": 0.15,
+        "deadline_min": 0.8,
+        "deadline_max": 2.0,
+        "p_non_atomic": 0.25,
+        "split_ratio_min": 0.25,
+        "split_ratio_max": 0.75
+      },
+  
+      "moderate": {
+        "lam_sec_min": 2.0,
+        "lam_sec_max": 3.0,
+        "b_median": 3.0,
+        "b_sigma_g": 1.60,
+        "rho_median": 1200000000.0,
+        "rho_sigma_g": 1.50,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.45,
+        "p_deadline": 0.25,
+        "deadline_min": 0.5,
+        "deadline_max": 1.5,
+        "p_non_atomic": 0.35,
+        "split_ratio_min": 0.30,
+        "split_ratio_max": 0.80
+      },
+  
+      "heavy": {
+        "lam_sec_min": 3.0,
+        "lam_sec_max": 5.0,
+        "b_median": 5.0,
+        "b_sigma_g": 1.70,
+        "rho_median": 1500000000.0,
+        "rho_sigma_g": 1.55,
+        "mem_median": 64.0,
+        "mem_sigma_g": 1.50,
+        "p_deadline": 0.35,
+        "deadline_min": 0.3,
+        "deadline_max": 1.0,
+        "p_non_atomic": 0.45,
+        "split_ratio_min": 0.40,
+        "split_ratio_max": 0.85
+      }
+    },
+  
+    "dataset": {
+      "episodes_each": 1,
+      "out_root": "./datasets",
+      "qcap": 0.99
+    }
+  }
+  

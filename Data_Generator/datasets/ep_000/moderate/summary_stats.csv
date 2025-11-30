@@ -1,0 +1,2 @@
+n_tasks,n_arrivals,tasks_per_hour,b_mb_median,b_mb_p90,b_mb_p99,rho_median,rho_p90,c_cycles_median,c_cycles_p90,c_cycles_p99,deadline_share,non_atomic_share,modality_counts_json
+4969,4969,162621.81796152238,3.0,5.0,5.0,1218958592.0,2043951718.3999999,4031205632.0,7962925260.8,12366014504.959965,0.24773596297041658,0.3517810424632723,"{""text"": 1487, ""image"": 1441, ""video"": 1040, ""sensor"": 1001}"

@@ -21,17 +21,14 @@ Directory layout (per episode):
   datasets/
     ep_000/
       light/
-        episodes.csv
-        agents.csv
-        arrivals.csv
-        tasks.csv
+        episodes.csv        # has N_mecs instead of N_agents
+        arrivals.csv        # uses mec_id
+        tasks.csv           # uses mec_id
         summary_stats.csv
         *.png
       moderate/
-        ...
       heavy/
-        ...
-      dataset_metadata.json   # meta info for ALL scenarios in this episode
+      dataset_metadata.json
 """
 
 from __future__ import annotations
@@ -43,6 +40,7 @@ import time
 import random
 import platform
 import getpass
+import hashlib
 from dataclasses import dataclass, asdict, replace
 from typing import List, Dict, Optional
 
@@ -54,10 +52,14 @@ import matplotlib.pyplot as plt
 # ============================================================
 # Load configuration from JSON
 # ============================================================
-CONFIG_PATH = "taskgen_config.json"  # adjust path if needed
+CONFIG_PATH = "dataset_config.json"
+ENV_CONFIG_PATH = "../Environment_Generator/environment_config.json"
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CFG = json.load(f)
+
+with open(ENV_CONFIG_PATH, "r", encoding="utf-8") as f:
+    ENV_CFG = json.load(f)
 
 # Global seed and RNGs
 GLOBAL_SEED = CFG["global_seed"]
@@ -76,6 +78,11 @@ TASK_CFG = CFG["task"]
 TASK_SIZE_MIN_MB = TASK_CFG["task_size_min_mb"]
 TASK_SIZE_MAX_MB = TASK_CFG["task_size_max_mb"]
 
+# Environment-level config (MEC / cloud)
+ENV_NUM_MECS = ENV_CFG["num_mecs"]
+if "mecs" in ENV_CFG and isinstance(ENV_CFG["mecs"], list):
+    assert len(ENV_CFG["mecs"]) == ENV_NUM_MECS, "num_mecs mismatch with length of 'mecs' list"
+
 
 # ============================================================
 # configuration dataclasses
@@ -89,46 +96,41 @@ class EpisodeConf:
     seed: int
 
 @dataclass
-class AgentRanges:
+class MecArrivalRanges:
     # arrival rate per SECOND (will be multiplied by Delta per slot)
     lam_sec_min: float
     lam_sec_max: float
-    # optional local capacities (kept as meta for later)
-    f_local_min: float
-    f_local_max: float
-    m_local_min: float
-    m_local_max: float
 
 @dataclass
 class TaskFeatureDist:
     # Lognormal parameterization via median and sigma_g (geometric std).
-    b_median: float = 3.0          # MB (kept for metadata; actual size is discrete now)
-    b_sigma_g: float = 1.5
+    b_median: float          # MB
+    b_sigma_g: float
 
-    rho_median: float = 1.2e9      # cycles / MB
-    rho_sigma_g: float = 1.5
+    rho_median: float        # cycles / MB
+    rho_sigma_g: float
 
-    mem_median: float = 64.0       # MB
-    mem_sigma_g: float = 1.5
+    mem_median: float        # MB
+    mem_sigma_g: float
 
-    p_deadline: float = 0.25
-    deadline_min: float = 0.3      # seconds (relative)
-    deadline_max: float = 1.5
+    p_deadline: float
+    deadline_min: float      # seconds (relative)
+    deadline_max: float
 
-    p_non_atomic: float = 0.35
-    split_ratio_min: float = 0.30  # fraction of task size that CAN be split
-    split_ratio_max: float = 0.80
+    p_non_atomic: float
+    split_ratio_min: float   # fraction of task size that CAN be split
+    split_ratio_max: float
 
     # Optional modality probabilities (image, video, text, sensor)
     modality_probs: Optional[List[float]] = None
-    modality_labels: List[str] = None
+    modality_labels: Optional[List[str]] = None
 
 @dataclass
 class GlobalConfig:
     name: str
-    N_agents: int
+    N_mecs: int
     Episode: EpisodeConf
-    AgentRanges: AgentRanges
+    ArrivalRanges: MecArrivalRanges
     TaskDist: TaskFeatureDist
 
 
@@ -136,14 +138,14 @@ class GlobalConfig:
 # asserts / validation
 # ============================================================
 def _validate_cfg(cfg: GlobalConfig) -> None:
-    assert cfg.N_agents > 0
+    assert cfg.N_mecs > 0
     assert cfg.Episode.Delta > 0
     assert cfg.Episode.T_slots > 0
     assert cfg.Episode.T_decision > 0
     assert cfg.Episode.T_drain >= 0
     assert cfg.Episode.T_slots == cfg.Episode.T_decision + cfg.Episode.T_drain
 
-    ar = cfg.AgentRanges
+    ar = cfg.ArrivalRanges
     assert ar.lam_sec_min >= 0 and ar.lam_sec_max >= ar.lam_sec_min
     td = cfg.TaskDist
     assert td.split_ratio_min > 0 and td.split_ratio_max <= 1.0 and td.split_ratio_max >= td.split_ratio_min
@@ -198,24 +200,27 @@ def lognormal_from_median_sigma_g(
 
 
 # ============================================================
-# entities
+# MEC entities (no agents any more)
 # ============================================================
 @dataclass
-class Agent:
-    agent_id: int
-    f_local: float
-    m_local: float
+class Mec:
+    """
+    A MEC node from the generator's point of view.
+    Only has an id and a Poisson arrival rate.
+    Resource capacities are defined in the environment (simulation_output).
+    """
+    mec_id: int
     lam_sec: float   # Poisson rate per second (not per-slot)
 
-
-def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
-    agents: List[Agent] = []
-    for i in range(cfg.N_agents):
-        lam_sec = rng.uniform(cfg.AgentRanges.lam_sec_min, cfg.AgentRanges.lam_sec_max)
-        f_loc   = rng.uniform(cfg.AgentRanges.f_local_min, cfg.AgentRanges.f_local_max)
-        m_loc   = rng.uniform(cfg.AgentRanges.m_local_min, cfg.AgentRanges.m_local_max)
-        agents.append(Agent(agent_id=i, f_local=f_loc, m_local=m_loc, lam_sec=lam_sec))
-    return agents
+def build_mecs(cfg: GlobalConfig, rng: np.random.Generator) -> List[Mec]:
+    """
+    Build a list of MEC nodes with Poisson arrival rates lam_sec.
+    """
+    mecs: List[Mec] = []
+    for i in range(cfg.N_mecs):
+        lam_sec = rng.uniform(cfg.ArrivalRanges.lam_sec_min, cfg.ArrivalRanges.lam_sec_max)
+        mecs.append(Mec(mec_id=i, lam_sec=lam_sec))
+    return mecs
 
 
 # ============================================================
@@ -235,20 +240,17 @@ def _modality_choice(rng: np.random.Generator, d: TaskFeatureDist) -> str:
         assert abs(sum(probs) - 1.0) < 1e-6 and len(probs) == len(labels)
     return rng.choice(labels, p=probs)
 
-
 def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: float = 0.99) -> Dict[str, float]:
     """
     Sample a single task's features.
 
-    - Task size (b_mb) is now discrete uniform integer in [TASK_SIZE_MIN_MB, TASK_SIZE_MAX_MB].
-    - Compute density (rho) and memory (mem_mb) remain lognormal.
+    - Task size (b_mb) is discrete uniform integer in [TASK_SIZE_MIN_MB, TASK_SIZE_MAX_MB].
+    - Compute density (rho) and memory (mem_mb) are lognormal.
     """
     d = cfg.TaskDist
 
     # Discrete uniform task size (MB) from JSON config
-    task_size_min = TASK_SIZE_MIN_MB
-    task_size_max = TASK_SIZE_MAX_MB
-    b_mb = int(rng.integers(task_size_min, task_size_max + 1))
+    b_mb = int(rng.integers(TASK_SIZE_MIN_MB, TASK_SIZE_MAX_MB + 1))
 
     rho    = lognormal_from_median_sigma_g(rng, d.rho_median, d.rho_sigma_g, qcap=qcap)
     c      = b_mb * rho                              # total cycles
@@ -272,7 +274,7 @@ def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: floa
 # ============================================================
 def run_episode(
     cfg: GlobalConfig,
-    agents: List[Agent],
+    mecs: List[Mec],
     episode_id: int = 0,
     qcap: float = 0.99
 ) -> Dict[str, pd.DataFrame]:
@@ -282,28 +284,19 @@ def run_episode(
     HOODIE-style:
       - t = 0 .. T_decision-1 → arrivals via Poisson
       - t = T_decision .. T_slots-1 → NO new arrivals (drain phase)
+
+    Each MEC has its own Poisson arrival process with rate lam_sec.
     """
     _validate_cfg(cfg)
     rng_local = np.random.default_rng(cfg.Episode.seed + episode_id)
 
     rows_episodes: List[Dict] = []
-    rows_agents:   List[Dict] = []
     rows_arrivals: List[Dict] = []
     rows_tasks:    List[Dict] = []
 
     Delta      = cfg.Episode.Delta
     T_slots    = cfg.Episode.T_slots
     T_decision = cfg.Episode.T_decision
-
-    # agents (include scenario for easier joins)
-    for a in agents:
-        rows_agents.append({
-            "scenario": cfg.name,
-            "agent_id": a.agent_id,
-            "f_local": a.f_local,
-            "m_local": a.m_local,
-            "lam_sec": a.lam_sec
-        })
 
     task_id_counter = 0
 
@@ -314,9 +307,9 @@ def run_episode(
         if t >= T_decision:
             continue
 
-        for a in agents:
+        for m in mecs:
             # per-slot rate from per-second rate:
-            lam_slot = a.lam_sec * Delta
+            lam_slot = m.lam_sec * Delta
             n_new = rng_local.poisson(lam=lam_slot)
             if n_new <= 0:
                 continue
@@ -336,7 +329,7 @@ def run_episode(
                     "episode_id": episode_id,
                     "t_slot": t,
                     "t_time": t_time,
-                    "agent_id": a.agent_id,
+                    "mec_id": m.mec_id,
                     "task_id": task_id_counter
                 })
 
@@ -344,7 +337,7 @@ def run_episode(
                     "scenario": cfg.name,
                     "episode_id": episode_id,
                     "task_id": task_id_counter,
-                    "agent_id": a.agent_id,
+                    "mec_id": m.mec_id,
                     "t_arrival_slot": t,
                     "t_arrival_time": t_time,
                     "b_mb": feat["b_mb"],
@@ -370,12 +363,11 @@ def run_episode(
         "T_decision": T_decision,
         "T_drain": cfg.Episode.T_drain,
         "hours": T_slots * Delta / 3600.0,
-        "N_agents": len(agents),
+        "N_mecs": len(mecs),
         "seed": cfg.Episode.seed + episode_id
     })
 
     episodes_df = pd.DataFrame(rows_episodes)
-    agents_df   = pd.DataFrame(rows_agents)
     arrivals_df = pd.DataFrame(rows_arrivals)
     tasks_df    = pd.DataFrame(rows_tasks)
 
@@ -384,7 +376,7 @@ def run_episode(
         tasks_df["modality"] = tasks_df["modality"].astype("category")
         tasks_df["action_space_hint"] = tasks_df["action_space_hint"].astype("category")
         # ints
-        for col in ["episode_id", "task_id", "agent_id", "t_arrival_slot", "has_deadline", "non_atomic"]:
+        for col in ["episode_id", "task_id", "mec_id", "t_arrival_slot", "has_deadline", "non_atomic"]:
             if col in tasks_df:
                 tasks_df[col] = tasks_df[col].astype("int32")
         # floats
@@ -394,21 +386,15 @@ def run_episode(
                 tasks_df[col] = tasks_df[col].astype("float32")
 
     if len(arrivals_df):
-        for col in ["episode_id", "t_slot", "agent_id", "task_id"]:
+        for col in ["episode_id", "t_slot", "mec_id", "task_id"]:
             if col in arrivals_df:
                 arrivals_df[col] = arrivals_df[col].astype("int32")
         for col in ["t_time"]:
             if col in arrivals_df:
                 arrivals_df[col] = arrivals_df[col].astype("float32")
 
-    if len(agents_df):
-        for col in ["agent_id"]:
-            agents_df[col] = agents_df[col].astype("int32")
-        for col in ["f_local", "m_local", "lam_sec"]:
-            agents_df[col] = agents_df[col].astype("float64")
-
     if len(episodes_df):
-        for col in ["episode_id", "N_agents", "T_slots", "T_decision", "T_drain"]:
+        for col in ["episode_id", "N_mecs", "T_slots", "T_decision", "T_drain"]:
             if col in episodes_df:
                 episodes_df[col] = episodes_df[col].astype("int32")
         for col in ["Delta", "hours"]:
@@ -417,7 +403,6 @@ def run_episode(
 
     return {
         "episodes": episodes_df,
-        "agents":   agents_df,
         "arrivals": arrivals_df,
         "tasks":    tasks_df
     }
@@ -439,7 +424,7 @@ def _config_fingerprint(cfg: GlobalConfig) -> str:
     s = json.dumps({
         "scenario": cfg.name,
         "Episode": asdict(cfg.Episode),
-        "AgentRanges": asdict(cfg.AgentRanges),
+        "ArrivalRanges": asdict(cfg.ArrivalRanges),
         "TaskDist": asdict(cfg.TaskDist)
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
@@ -483,20 +468,18 @@ def save_episode_meta(
             "name": cfg.name,
             "fingerprint": _config_fingerprint(cfg),
             "Episode": asdict(cfg.Episode),
-            "N_agents": cfg.N_agents,
-            "AgentRanges": asdict(cfg.AgentRanges),
+            "N_mecs": cfg.N_mecs,
+            "ArrivalRanges": asdict(cfg.ArrivalRanges),
             "TaskDist": asdict(cfg.TaskDist),
             "units": {
                 "Delta": "seconds",
-                "lam_sec": "tasks per second (per agent)",
+                "lam_sec": "tasks per second (per MEC)",
                 "per_slot_rate": "lam_sec * Delta",
                 "b_mb": "MB",
                 "rho_cyc_per_mb": "CPU cycles per MB",
                 "c_cycles": "CPU cycles",
                 "mem_mb": "MB",
-                "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s",
-                "f_local": "Hz",
-                "m_local": "MB"
+                "deadline_s": "seconds (relative); deadline_time = t_arrival_time + deadline_s"
             }
         })
 
@@ -537,8 +520,8 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         "c_cycles_median": [q(tasks["c_cycles"], 0.5)] if len(tasks) else [float("nan")],
         "c_cycles_p90": [q(tasks["c_cycles"], 0.9)] if len(tasks) else [float("nan")],
         "c_cycles_p99": [q(tasks["c_cycles"], 0.99)] if len(tasks) else [float("nan")],
-        "deadline_share": [float((tasks["has_deadline"] == 1).mean()) if len(tasks) else float("nan")],
-        "non_atomic_share": [float((tasks["non_atomic"] == 1).mean()) if len(tasks) else float("nan")],
+        "deadline_share": [float((tasks["has_deadline"] == 1).mean()) if len(tasks) else [float("nan")]][0],
+        "non_atomic_share": [float((tasks["non_atomic"] == 1).mean()) if len(tasks) else [float("nan")]][0],
         "modality_counts_json": [json.dumps(mod_dist)]
     }
     pd.DataFrame(summary).to_csv(os.path.join(out_dir, "summary_stats.csv"), index=False)
@@ -568,23 +551,22 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         hist_plot(tasks.loc[tasks["non_atomic"] == 1, "split_ratio"],
                   title="Split ratio (only non-atomic)", fname="hist_split_ratio.png", logx=False)
 
-    # arrivals per agent
+    # arrivals per MEC
     if len(arrivals):
-        per_agent = arrivals.groupby("agent_id").size()
+        per_mec = arrivals.groupby("mec_id").size()
         plt.figure()
-        plt.bar(per_agent.index.astype(str), per_agent.values)
-        plt.title("Arrivals per agent")
-        plt.xlabel("agent_id")
+        plt.bar(per_mec.index.astype(str), per_mec.values)
+        plt.title("Arrivals per MEC")
+        plt.xlabel("mec_id")
         plt.ylabel("count")
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "bar_arrivals_per_agent.png"), dpi=160)
+        plt.savefig(os.path.join(out_dir, "bar_arrivals_per_mec.png"), dpi=160)
         plt.close()
 
 
 # ============================================================
 # scenario presets (constructed from JSON)
 # ============================================================
-# Episode base from JSON
 EPISODE_CFG = CFG["episode"]
 DELTA      = EPISODE_CFG["delta"]
 T_DECISION = EPISODE_CFG["t_decision"]
@@ -599,37 +581,21 @@ BASE_EPISODE = EpisodeConf(
     seed=GLOBAL_SEED
 )
 
-# Agent base ranges (lam_sec_min/max overridden per-scenario)
-AGENT_CFG = CFG["agents"]
 SC_LIGHT  = CFG["scenarios"]["light"]
 SC_MOD    = CFG["scenarios"]["moderate"]
 SC_HEAVY  = CFG["scenarios"]["heavy"]
-
-BASE_AGENT_RANGES = AgentRanges(
-    lam_sec_min=SC_LIGHT["lam_sec_min"],   # base placeholder; overridden for each scenario
-    lam_sec_max=SC_HEAVY["lam_sec_max"],   # base placeholder
-    f_local_min=AGENT_CFG["f_local_min"],
-    f_local_max=AGENT_CFG["f_local_max"],
-    m_local_min=AGENT_CFG["m_local_min"],
-    m_local_max=AGENT_CFG["m_local_max"]
-)
-
-# Base TaskFeatureDist; scenario-specific overrides applied with replace(...)
-BASE_TASK_DIST = TaskFeatureDist()
 
 SCENARIOS: List[GlobalConfig] = [
     # ---- LIGHT ----
     GlobalConfig(
         name="light",
-        N_agents=SC_LIGHT["n_agents"],
+        N_mecs=ENV_NUM_MECS,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 101),
-        AgentRanges=replace(
-            BASE_AGENT_RANGES,
+        ArrivalRanges=MecArrivalRanges(
             lam_sec_min=SC_LIGHT["lam_sec_min"],
             lam_sec_max=SC_LIGHT["lam_sec_max"]
         ),
-        TaskDist=replace(
-            BASE_TASK_DIST,
+        TaskDist=TaskFeatureDist(
             b_median=SC_LIGHT["b_median"],
             b_sigma_g=SC_LIGHT["b_sigma_g"],
             rho_median=SC_LIGHT["rho_median"],
@@ -648,15 +614,13 @@ SCENARIOS: List[GlobalConfig] = [
     # ---- MODERATE ----
     GlobalConfig(
         name="moderate",
-        N_agents=SC_MOD["n_agents"],
+        N_mecs=ENV_NUM_MECS,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 202),
-        AgentRanges=replace(
-            BASE_AGENT_RANGES,
+        ArrivalRanges=MecArrivalRanges(
             lam_sec_min=SC_MOD["lam_sec_min"],
             lam_sec_max=SC_MOD["lam_sec_max"]
         ),
-        TaskDist=replace(
-            BASE_TASK_DIST,
+        TaskDist=TaskFeatureDist(
             b_median=SC_MOD["b_median"],
             b_sigma_g=SC_MOD["b_sigma_g"],
             rho_median=SC_MOD["rho_median"],
@@ -675,15 +639,13 @@ SCENARIOS: List[GlobalConfig] = [
     # ---- HEAVY ----
     GlobalConfig(
         name="heavy",
-        N_agents=SC_HEAVY["n_agents"],
+        N_mecs=ENV_NUM_MECS,
         Episode=replace(BASE_EPISODE, seed=GLOBAL_SEED + 303),
-        AgentRanges=replace(
-            BASE_AGENT_RANGES,
+        ArrivalRanges=MecArrivalRanges(
             lam_sec_min=SC_HEAVY["lam_sec_min"],
             lam_sec_max=SC_HEAVY["lam_sec_max"]
         ),
-        TaskDist=replace(
-            BASE_TASK_DIST,
+        TaskDist=TaskFeatureDist(
             b_median=SC_HEAVY["b_median"],
             b_sigma_g=SC_HEAVY["b_sigma_g"],
             rho_median=SC_HEAVY["rho_median"],
@@ -706,7 +668,7 @@ SCENARIOS: List[GlobalConfig] = [
 # ============================================================
 def main_generate_for_scenario(
     cfg: GlobalConfig,
-    agents: List[Agent],
+    mecs: List[Mec],
     episode_id: int,
     ep_dir: str,
     qcap: float = 0.99
@@ -721,7 +683,7 @@ def main_generate_for_scenario(
     scenario_dir = os.path.join(ep_dir, cfg.name)
     os.makedirs(scenario_dir, exist_ok=True)
 
-    dfs = run_episode(cfg, agents, episode_id=episode_id, qcap=qcap)
+    dfs = run_episode(cfg, mecs, episode_id=episode_id, qcap=qcap)
     paths = save_dataset(dfs, out_dir=scenario_dir)
     summarize_and_plot(dfs, out_dir=scenario_dir)
 
@@ -739,19 +701,14 @@ def generate_all_scenarios(
         ...
     And inside each ep_xxx we store dataset_metadata.json
     with info for ALL scenarios.
-
-    NOTE:
-      - To fully mimic HOODIE training (e.g., many episodes), call:
-            generate_all_scenarios(episodes_each=5000, ...)
-      - Default episodes_each=1 is for debugging.
     """
     results: Dict[str, Dict[str, str]] = {}
 
-    # For stability, build agents per scenario once (same pool across episodes for that scenario)
-    agents_per_scenario: Dict[str, List[Agent]] = {}
+    # For stability, build MEC list per scenario once (same pool across episodes for that scenario)
+    mecs_per_scenario: Dict[str, List[Mec]] = {}
     for cfg in SCENARIOS:
-        rng_agents = np.random.default_rng(cfg.Episode.seed + 10_000)
-        agents_per_scenario[cfg.name] = build_agents(cfg, rng_agents)
+        rng_mecs = np.random.default_rng(cfg.Episode.seed + 10_000)
+        mecs_per_scenario[cfg.name] = build_mecs(cfg, rng_mecs)
 
     for ep in range(episodes_each):
         ep_name = f"ep_{ep:03d}"
@@ -760,10 +717,10 @@ def generate_all_scenarios(
 
         episode_paths: Dict[str, str] = {}
         for cfg in SCENARIOS:
-            agents = agents_per_scenario[cfg.name]
+            mecs = mecs_per_scenario[cfg.name]
             paths = main_generate_for_scenario(
                 cfg=cfg,
-                agents=agents,
+                mecs=mecs,
                 episode_id=ep,
                 ep_dir=ep_dir,
                 qcap=qcap
@@ -789,9 +746,8 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
     Lightweight sanity checks for one ep_xxx:
       - basic file presence
       - tasks vs arrivals count & task_id consistency
-      - agent_id consistency
+      - mec_id in valid range [0, N_mecs-1]
       - basic value ranges (positivity, deadlines, split_ratio)
-      - rough consistency between lambda and realized tasks/hour (on decision slots)
     """
     print(f"[sanity] Checking episode directory: {ep_dir}")
     meta_path = os.path.join(ep_dir, "dataset_metadata.json")
@@ -813,14 +769,13 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
 
         try:
             episodes_df = pd.read_csv(os.path.join(scen_dir, "episodes.csv"))
-            agents_df   = pd.read_csv(os.path.join(scen_dir, "agents.csv"))
             arrivals_df = pd.read_csv(os.path.join(scen_dir, "arrivals.csv"))
             tasks_df    = pd.read_csv(os.path.join(scen_dir, "tasks.csv"))
         except Exception as e:
             print(f"  [WARN] Failed to load CSVs for scenario '{scen}': {e}")
             continue
 
-        print(f"  [scenario={scen}] n_tasks={len(tasks_df)}, n_arrivals={len(arrivals_df)}, n_agents={len(agents_df)}")
+        print(f"  [scenario={scen}] n_tasks={len(tasks_df)}, n_arrivals={len(arrivals_df)}")
 
         # 1) non-empty checks
         if len(tasks_df) == 0 or len(arrivals_df) == 0:
@@ -834,14 +789,16 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
         if tasks_df["task_id"].nunique() != len(tasks_df):
             print(f"    [WARN] Duplicate task_id in tasks.csv for scenario '{scen}'")
 
-        # 3) agent_id consistency
-        agents_set = set(agents_df["agent_id"].tolist())
-        arr_agents = set(arrivals_df["agent_id"].tolist())
-        task_agents = set(tasks_df["agent_id"].tolist())
-        if not arr_agents.issubset(agents_set):
-            print(f"    [WARN] Some arrival agent_ids not in agents table for '{scen}'")
-        if not task_agents.issubset(agents_set):
-            print(f"    [WARN] Some task agent_ids not in agents table for '{scen}'")
+        # 3) mec_id consistency: must be in [0, N_mecs-1]
+        try:
+            N_mecs = int(episodes_df.iloc[0]["N_mecs"])
+            mec_ids_tasks = set(tasks_df["mec_id"].unique().tolist())
+            mec_ids_arr   = set(arrivals_df["mec_id"].unique().tolist())
+            all_ids = mec_ids_tasks.union(mec_ids_arr)
+            if any((mid < 0 or mid >= N_mecs) for mid in all_ids):
+                print(f"    [WARN] Some mec_id values out of range [0, N_mecs-1] in '{scen}'")
+        except Exception as e:
+            print(f"    [WARN] Failed to check mec_id range for '{scen}': {e}")
 
         # 4) basic value ranges
         if (tasks_df["b_mb"] <= 0).any():
@@ -867,25 +824,6 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
         if (~np.isclose(tasks_df.loc[mask, "split_ratio"], 0.0)).any():
             print(f"    [WARN] non_atomic==0 but split_ratio != 0 (float mismatch) in '{scen}'")
 
-        # 5) rough lambda consistency check (using decision horizon length)
-        if len(episodes_df):
-            hours = float(episodes_df.iloc[0]["T_decision"] * episodes_df.iloc[0]["Delta"]) / 3600.0
-            if hours > 0:
-                # arrivals only exist in decision slots by construction
-                tasks_per_agent = arrivals_df.groupby("agent_id").size() / hours
-                merged = pd.merge(
-                    agents_df[["agent_id", "lam_sec"]],
-                    tasks_per_agent.rename("tasks_per_hour").reset_index(),
-                    on="agent_id",
-                    how="left"
-                )
-                merged["lam_per_hour"] = merged["lam_sec"] * 3600.0
-                merged["ratio"] = merged["tasks_per_hour"] / merged["lam_per_hour"]
-                too_low = (merged["ratio"] < 0.4).sum()
-                too_high = (merged["ratio"] > 1.6).sum()
-                if too_low + too_high > 0:
-                    print(f"    [INFO] Poisson check: some agents have realized rate far from expected "
-                          f"(too_low={too_low}, too_high={too_high}) in '{scen}'")
 
 def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
     """
