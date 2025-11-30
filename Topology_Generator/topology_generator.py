@@ -9,9 +9,11 @@ import hashlib
 import platform
 import getpass
 import pandas as pd
+
 import networkx as nx
 import matplotlib.pyplot as plt
 print("OK")
+
 
 # Optional deps (for graph)
 try:
@@ -68,7 +70,7 @@ class TopologyHyper:
     MEC / Cloud compute capacities are loaded from environment files,
     so this class only stores structural and link-level parameters.
     """
-    
+
     time_step: float
 
     # Link bandwidths (to be provided as inputs by the user)
@@ -332,6 +334,7 @@ def build_topology(
       - MEC / Cloud capacities from CSV
       - structural parameters from TopologyHyper
     """
+
     
     print("inside build_topology")
     # Optional RNG in case you later want stochastic behaviors
@@ -474,3 +477,4 @@ if __name__ == "__main__":
         out_root="./topologies"
     )
     print(json.dumps(out_dirs, indent=2))
+    
