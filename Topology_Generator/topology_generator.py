@@ -9,11 +9,9 @@ import hashlib
 import platform
 import getpass
 import pandas as pd
-
 import networkx as nx
 import matplotlib.pyplot as plt
 print("OK")
-
 
 # Optional deps (for graph)
 try:
@@ -27,12 +25,10 @@ except Exception:
 # ============================================================
 # Utility functions
 # ============================================================
-
 def _fp(obj: dict) -> str:
     """Compute a short fingerprint for a dictionary."""
     s = json.dumps(obj, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
-
 
 def _save_json(obj: dict, path: str) -> str:
     """Save a dictionary as pretty-printed JSON."""
@@ -41,14 +37,12 @@ def _save_json(obj: dict, path: str) -> str:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     return path
 
-
 def _save_text(text: str, path: str) -> str:
     """Save plain text to a file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path
-
 
 def _save_matrix_csv(M: np.ndarray, path: str) -> str:
     """Save connection matrix as a CSV with MEC labels and a cloud column."""
@@ -67,7 +61,6 @@ def _save_matrix_csv(M: np.ndarray, path: str) -> str:
 # ============================================================
 # Data classes (TopologyHyper)
 # ============================================================
-
 @dataclass
 class TopologyHyper:
     """
@@ -75,7 +68,7 @@ class TopologyHyper:
     MEC / Cloud compute capacities are loaded from environment files,
     so this class only stores structural and link-level parameters.
     """
-
+    
     time_step: float
 
     # Link bandwidths (to be provided as inputs by the user)
@@ -99,7 +92,6 @@ class TopologyHyper:
 # ============================================================
 # Reading MEC / Cloud data
 # ============================================================
-
 def read_environment_files(mec_file: str, cloud_file: str):
     """
     Read MEC and Cloud capacities from CSV files.
@@ -107,7 +99,6 @@ def read_environment_files(mec_file: str, cloud_file: str):
       - MEC CSV: 'Private CPU Capacity', 'Public CPU Capacity'
       - Cloud CSV: 'computational_capacity'
     """
-    
     
     print("inside read_environment_files")
     mec_df = pd.read_csv(mec_file)
@@ -125,7 +116,6 @@ def read_environment_files(mec_file: str, cloud_file: str):
 # ============================================================
 # Build Connection Matrix
 # ============================================================
-
 def _build_connection_matrix(h: TopologyHyper, K: int) -> np.ndarray:
     """
     Build connection matrix of shape (K, K+1):
@@ -203,7 +193,6 @@ def _build_connection_matrix(h: TopologyHyper, K: int) -> np.ndarray:
                     M[i, j] = max(M[i, j], weak)
                     if h.symmetric:
                         M[j, i] = max(M[j, i], weak)
-
     else:
         # Unknown topology_type → no horizontal links
         pass
@@ -224,7 +213,6 @@ def _build_connection_matrix(h: TopologyHyper, K: int) -> np.ndarray:
 # ============================================================
 # Graph drawing
 # ============================================================
-
 def _draw_graph_png(M: np.ndarray,
                     out_png: str,
                     title: str = "MEC Graph (MB/slot)",
@@ -286,7 +274,6 @@ def _draw_graph_png(M: np.ndarray,
 # ============================================================
 # Markdown Report Writer
 # ============================================================
-
 def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out_md: str):
     """Write a simple Markdown report summarizing the topology."""
     K = topo["number_of_servers"]
@@ -333,7 +320,6 @@ def _write_markdown_report(topo: dict, meta: dict, graph_png: Optional[str], out
 # ============================================================
 # Main builder
 # ============================================================
-
 def build_topology(
     h: TopologyHyper,
     mec_csv_path: str,
@@ -346,7 +332,6 @@ def build_topology(
       - MEC / Cloud capacities from CSV
       - structural parameters from TopologyHyper
     """
-
     
     print("inside build_topology")
     # Optional RNG in case you later want stochastic behaviors
@@ -413,7 +398,6 @@ def build_topology(
 # ============================================================
 # Build multiple variants
 # ============================================================
-
 def build_three_topologies_variants(
     mec_csv_path: str,
     cloud_csv_path: str,
@@ -467,7 +451,6 @@ def build_three_topologies_variants(
 # ============================================================
 # Example entrypoint (optional)
 # ============================================================
-
 if __name__ == "__main__":
     print("hi")
     # Example usage (you can adjust paths and parameters as needed)

@@ -50,10 +50,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+
 # ============================================================
 # Load configuration from JSON
 # ============================================================
-
 CONFIG_PATH = "taskgen_config.json"  # adjust path if needed
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -76,10 +76,10 @@ TASK_CFG = CFG["task"]
 TASK_SIZE_MIN_MB = TASK_CFG["task_size_min_mb"]
 TASK_SIZE_MAX_MB = TASK_CFG["task_size_max_mb"]
 
+
 # ============================================================
 # configuration dataclasses
 # ============================================================
-
 @dataclass
 class EpisodeConf:
     Delta: float        # seconds per slot
@@ -87,7 +87,6 @@ class EpisodeConf:
     T_decision: int     # number of slots with arrivals
     T_drain: int        # number of drain slots without arrivals
     seed: int
-
 
 @dataclass
 class AgentRanges:
@@ -99,7 +98,6 @@ class AgentRanges:
     f_local_max: float
     m_local_min: float
     m_local_max: float
-
 
 @dataclass
 class TaskFeatureDist:
@@ -125,7 +123,6 @@ class TaskFeatureDist:
     modality_probs: Optional[List[float]] = None
     modality_labels: List[str] = None
 
-
 @dataclass
 class GlobalConfig:
     name: str
@@ -138,7 +135,6 @@ class GlobalConfig:
 # ============================================================
 # asserts / validation
 # ============================================================
-
 def _validate_cfg(cfg: GlobalConfig) -> None:
     assert cfg.N_agents > 0
     assert cfg.Episode.Delta > 0
@@ -159,7 +155,6 @@ def _validate_cfg(cfg: GlobalConfig) -> None:
 # ============================================================
 # helpers (lognormal quantiles)
 # ============================================================
-
 _Z_TABLE = {
     0.90: 1.2815515655446004,
     0.95: 1.6448536269514722,
@@ -205,7 +200,6 @@ def lognormal_from_median_sigma_g(
 # ============================================================
 # entities
 # ============================================================
-
 @dataclass
 class Agent:
     agent_id: int
@@ -227,7 +221,6 @@ def build_agents(cfg: GlobalConfig, rng: np.random.Generator) -> List[Agent]:
 # ============================================================
 # task features
 # ============================================================
-
 def _modality_choice(rng: np.random.Generator, d: TaskFeatureDist) -> str:
     # modality labels and probabilities
     if d.modality_labels is None:
@@ -277,7 +270,6 @@ def sample_task_features(cfg: GlobalConfig, rng: np.random.Generator, qcap: floa
 # ============================================================
 # episode generator (arrivals only)
 # ============================================================
-
 def run_episode(
     cfg: GlobalConfig,
     agents: List[Agent],
@@ -434,7 +426,6 @@ def run_episode(
 # ============================================================
 # save & plotting utilities
 # ============================================================
-
 def save_dataset(dfs: Dict[str, pd.DataFrame], out_dir: str = ".") -> Dict[str, str]:
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
@@ -444,7 +435,6 @@ def save_dataset(dfs: Dict[str, pd.DataFrame], out_dir: str = ".") -> Dict[str, 
         paths[name + "_csv"] = csv_path
     return paths
 
-
 def _config_fingerprint(cfg: GlobalConfig) -> str:
     s = json.dumps({
         "scenario": cfg.name,
@@ -453,7 +443,6 @@ def _config_fingerprint(cfg: GlobalConfig) -> str:
         "TaskDist": asdict(cfg.TaskDist)
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(s).hexdigest()[:16]
-
 
 def save_episode_meta(
     cfgs: List[GlobalConfig],
@@ -515,7 +504,6 @@ def save_episode_meta(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return path
-
 
 def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
@@ -596,7 +584,6 @@ def summarize_and_plot(dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
 # ============================================================
 # scenario presets (constructed from JSON)
 # ============================================================
-
 # Episode base from JSON
 EPISODE_CFG = CFG["episode"]
 DELTA      = EPISODE_CFG["delta"]
@@ -717,7 +704,6 @@ SCENARIOS: List[GlobalConfig] = [
 # ============================================================
 # drivers: per-scenario & all-scenarios
 # ============================================================
-
 def main_generate_for_scenario(
     cfg: GlobalConfig,
     agents: List[Agent],
@@ -740,7 +726,6 @@ def main_generate_for_scenario(
     summarize_and_plot(dfs, out_dir=scenario_dir)
 
     return paths
-
 
 def generate_all_scenarios(
     episodes_each: int = 1,
@@ -799,7 +784,6 @@ def generate_all_scenarios(
 # ============================================================
 # sanity checks
 # ============================================================
-
 def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
     """
     Lightweight sanity checks for one ep_xxx:
@@ -903,7 +887,6 @@ def sanity_check_episode(ep_dir: str, scenario_names: List[str]) -> None:
                     print(f"    [INFO] Poisson check: some agents have realized rate far from expected "
                           f"(too_low={too_low}, too_high={too_high}) in '{scen}'")
 
-
 def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
     """
     Run sanity checks over all ep_* folders under out_root.
@@ -926,7 +909,6 @@ def sanity_check_root(out_root: str, scenario_names: List[str]) -> None:
 # ============================================================
 # main
 # ============================================================
-
 if __name__ == "__main__":
     # Use dataset config from JSON
     results = generate_all_scenarios(
