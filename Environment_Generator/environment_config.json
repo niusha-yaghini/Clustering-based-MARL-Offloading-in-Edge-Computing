@@ -1,0 +1,115 @@
+{
+  "num_mecs": 20,
+  "num_clouds": 1,
+  "folder_path": "./simulation_output",
+
+  "mecs": [
+    {
+      "id": 0,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 1,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 2,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 3,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 4,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 5,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 6,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 7,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 8,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 9,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 10,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 11,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 12,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 13,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 14,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 15,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 16,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 17,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 18,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    },
+    {
+      "id": 19,
+      "private_cpu_capacity": 5.0,
+      "public_cpu_capacity": 5.0
+    }
+  ],
+
+  "clouds": [
+    {
+      "id": 0,
+      "computational_capacity": 30.0
+    }
+  ]
+}

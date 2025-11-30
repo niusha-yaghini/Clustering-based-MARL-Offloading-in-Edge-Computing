@@ -716,7 +716,7 @@ def validate_episode_delta_consistency(ep_name: str, ep_dict: dict) -> list:
 
     return errors
 
-def validate_everything_episode_first(datasets: dict,
+def validate_everything(datasets: dict,
                                       topologies: dict,
                                       environment: dict) -> dict:
     """
@@ -806,7 +806,7 @@ def validate_everything_episode_first(datasets: dict,
     return report
 
 # ---------- Pretty printer ----------
-def print_validation_report_episode_first(report: dict):
+def print_validation_report(report: dict):
     print("=== ENVIRONMENT (MEC + Cloud) ===")
     env_info = report.get("environment")
     if env_info:
@@ -853,8 +853,8 @@ def print_validation_report_episode_first(report: dict):
             print(f"  - {e}")
 
 
-report = validate_everything_episode_first(datasets, topologies, environment)
-print_validation_report_episode_first(report)
+report = validate_everything(datasets, topologies, environment)
+print_validation_report(report)
 
 all_ok = (
     # datasets
@@ -954,11 +954,6 @@ def align_units_for_dataset(dataset: Dict[str, pd.DataFrame]) -> Dict[str, pd.Da
         "tasks":    tasks,
     }
 
-# In the align_environment_units function, we assumed that the numbers stored 
-    # in the environment are "capacity per second" or "base unit" and multiplied
-    # by Delta to get per-slot. If we later decide to change the meaning of capacities,
-    # we only need to update the code here.
-
 # ===== Verification: per-environment against a target Delta =====
 def align_environment_units(environment: dict, target_Delta: float) -> dict:
     """
@@ -1051,7 +1046,7 @@ def verify_topology_units(topology: Dict[str, Any], target_Delta: float) -> Tupl
     return (True, "topology verified (per-slot, consistent).")
 
 # ===== Batch alignment for ALL datasets (episode-first) & ALL topologies =====
-def align_all_units_episode_first(
+def align_all_units(
     datasets_ep_first: Dict[str, Dict[str, Dict[str, pd.DataFrame]]],
     topologies_by_name: Dict[str, Dict[str, Any]],
     environment: dict
@@ -1139,8 +1134,8 @@ def align_all_units_episode_first(
 
     return out
 
-# ===== Pretty printer (episode-first) =====
-def print_alignment_summary_episode_first(result: Dict[str, Any]):
+# ===== Pretty printer =====
+def print_alignment_summary(result: Dict[str, Any]):
     # ===== DATASETS =====
     print("=== DATASETS (aligned, episode/scenario) ===")
     for ep_name in sorted(result["datasets_aligned"].keys()):
@@ -1192,12 +1187,12 @@ def print_alignment_summary_episode_first(result: Dict[str, Any]):
     print("  cloud_capacity_per_slot:    ", cloud_slot)
 
 
-result_align = align_all_units_episode_first(
+result_align = align_all_units(
     datasets_ep_first=datasets,
     topologies_by_name=topologies,
     environment=environment
 )
-print_alignment_summary_episode_first(result_align)
+print_alignment_summary(result_align)
 
 print("\n ===EXAMPLE===")
 aligned_light_ep0 = result_align["datasets_aligned"]["ep_000"]["light"]
@@ -1210,11 +1205,16 @@ tasks_ep0_light   = aligned_light_ep0["tasks"]    # has deadline_slots
 
 # 1.4. Build Scenario–Topology Pairs
 
-# In this step, all datasets are paired with all topologies (Cartesian product). 
-# Each pair is checked for matching time parameters, then a basic bundle is created for further enrichment.
-
-# We pair every (episode, scenario) dataset with every topology.
-# Output shape:
+# In this step, we create a Cartesian product between:
+#   - all (episode, scenario) datasets
+#   - all topologies
+#
+# For each (topology, episode, scenario) triple we build a "bundle" that contains:
+#   - the aligned dataset (episodes, agents, arrivals, tasks)
+#   - the topology (JSON + connection matrix)
+#   - the aligned environment (MEC + Cloud capacities)
+#
+# Output structure (topology-first):
 # pairs_by_topology = {
 #   "<topology_name>": {
 #       "<ep_XXX>": {
@@ -1223,25 +1223,30 @@ tasks_ep0_light   = aligned_light_ep0["tasks"]    # has deadline_slots
 #               'episode': <str>,
 #               'topology': <str>,
 #               'Delta': <float>,
-#               'K': <int>,
+#               'K': <int>,  # number_of_servers
 #               'dataset': {episodes, agents, arrivals, tasks},
 #               'topology_data': <dict>,
 #               'topology_meta_data': <dict or None>,
 #               'connection_matrix_df': <pd.DataFrame>,  # shape (K, K+1)
-#               'checks': {'delta_match': bool, 'message': str}
+#               'environment': <dict>,  # aligned environment (same for all pairs)
+#               'checks': {
+#                   'delta_match': bool,
+#                   'env_servers_match': bool,
+#                   'message': str
+#               }
 #           }, ...
 #       }, ...
 #   }, ...
-# }
+# 
 
 def _delta_from_episodes(episodes_df: pd.DataFrame) -> float:
     """Extract a single Delta value from episodes table."""
     if "Delta" not in episodes_df.columns:
-        raise ValueError("episodes.csv must contain 'Delta'.")
+        raise ValueError("episodes.csv must contain a 'Delta' column.")
     return float(episodes_df["Delta"].iloc[0])
 
 def _topology_time_step(topo_json: Dict[str, Any]) -> float:
-    """Extract the topology time_step."""
+    """Extract the topology time_step from topology.json."""
     ts = topo_json.get("time_step", None)
     if ts is None:
         raise ValueError("topology.json must contain 'time_step'.")
@@ -1250,25 +1255,56 @@ def _topology_time_step(topo_json: Dict[str, Any]) -> float:
 def build_topology_episode_pairs(
     datasets_ep_first: Dict[str, Dict[str, Dict[str, Any]]],
     topologies: Dict[str, Dict[str, Any]],
-    strict_delta_match: bool = True
+    environment: dict,
+    strict_delta_match: bool = True,
+    strict_env_match: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     Build pairs between every topology and every (episode, scenario) dataset.
 
-    datasets_ep_first شکل:
+    Parameters
+    ----------
+    datasets_ep_first :
+        Episode-first datasets, shape:
         {
           "ep_000": {
              "light":   {"episodes": df, "agents": df, "arrivals": df, "tasks": df},
              "moderate":{...},
              "heavy":   {...},
-             "_meta":   {...}  # only meta data without episodes/agents/tasks
+             "_meta":   {...}  # metadata only (no episodes/agents/tasks)
           },
           ...
         }
+
+    topologies :
+        Dict of topologies as returned by load_topologies_from_directory, e.g.:
+        {
+          "clustered": {
+              "topology_data": dict,
+              "meta_data": dict,
+              "connection_matrix": DataFrame
+          },
+          ...
+        }
+
+    environment :
+        Aligned environment dictionary as returned by align_all_units(...)
+        under key "environment_aligned".
+
+    strict_delta_match :
+        If True, raise an error when dataset Delta != topology time_step.
+
+    strict_env_match :
+        If True, raise an error when topology.number_of_servers != environment.num_servers.
     """
+    if environment is None:
+        raise ValueError("environment must not be None in build_topology_episode_pairs.")
+
+    env_num_servers = int(environment["num_servers"])
+
     pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-    # Iterate topologies first (topology-centric)
+    # Iterate over topologies first (topology-centric view)
     for topo_name, topo_bundle in topologies.items():
         topo_data = topo_bundle.get("topology_data", None)
         meta_data = topo_bundle.get("meta_data", None)
@@ -1288,27 +1324,47 @@ def build_topology_episode_pairs(
                 f"[{topo_name}] connection_matrix shape must be (K, K+1); got {cm_df.shape}"
             )
 
+        # Check consistency between topology and environment (number of MEC servers)
+        env_match_ok = (K == env_num_servers)
+        if (not env_match_ok) and strict_env_match:
+            raise ValueError(
+                f"[{topo_name}] number_of_servers ({K}) != environment.num_servers ({env_num_servers})"
+            )
+
         topo_ts = _topology_time_step(topo_data)
 
-        # Prepare container for this topology
+        # Initialize container for this topology
         pairs_by_topology[topo_name] = {}
 
-        # Compare with every (episode, scenario)
+        # Compare against every (episode, scenario)
         for ep_name, scenarios in datasets_ep_first.items():
             pairs_by_topology[topo_name][ep_name] = {}
             for scen_name, ds in scenarios.items():
+                # Skip metadata entries such as "_meta"
                 if not (isinstance(ds, dict) and "episodes" in ds):
                     continue
 
                 ds_Delta = _delta_from_episodes(ds["episodes"])
                 delta_ok = bool(np.isclose(ds_Delta, topo_ts, atol=1e-12))
-                msg = "OK" if delta_ok else (
+                msg_delta = "OK" if delta_ok else (
                     f"time_step mismatch (dataset Delta={ds_Delta}, topology time_step={topo_ts})"
                 )
-                if (not delta_ok) and strict_delta_match:
-                    raise ValueError(f"[{topo_name} × {ep_name}/{scen_name}] {msg}")
 
-                # Store bundle
+                msg_env = "OK" if env_match_ok else (
+                    f"env.num_servers ({env_num_servers}) != topology.K ({K})"
+                )
+
+                # If Delta mismatch is not tolerated, raise immediately
+                if (not delta_ok) and strict_delta_match:
+                    raise ValueError(f"[{topo_name} × {ep_name}/{scen_name}] {msg_delta}")
+
+                # Build final message from delta + environment checks
+                if delta_ok and env_match_ok:
+                    final_msg = "OK"
+                else:
+                    final_msg = f"{msg_delta}; {msg_env}"
+
+                # Store bundle for this (topology, episode, scenario)
                 pairs_by_topology[topo_name][ep_name][scen_name] = {
                     "scenario": scen_name,
                     "episode": ep_name,
@@ -1319,7 +1375,12 @@ def build_topology_episode_pairs(
                     "topology_data": topo_data,
                     "topology_meta_data": meta_data,
                     "connection_matrix_df": cm_df,
-                    "checks": {"delta_match": delta_ok, "message": msg}
+                    "environment": environment,   # same aligned environment for all pairs
+                    "checks": {
+                        "delta_match": delta_ok,
+                        "env_servers_match": env_match_ok,
+                        "message": final_msg
+                    }
                 }
 
     return pairs_by_topology
@@ -1327,8 +1388,12 @@ def build_topology_episode_pairs(
 def print_pairs_summary_topology_first_ep(
     pairs_by_topology: Dict[str, Dict[str, Dict[str, Any]]]
 ) -> None:
-    """Pretty-print summary as topology → episode → scenario."""
-    print("=== TOPOLOGY × EPISODE × SCENARIO ===")
+    """
+    Pretty-print summary of pairs in the form:
+
+        EPISODE -> TOPOLOGY -> SCENARIO
+    """
+    print("=== EPISODE × TOPOLOGY × SCENARIO ===")
     for topo_name, by_ep in pairs_by_topology.items():
         print(f"[TOPOLOGY] {topo_name}")
         for ep_name in sorted(by_ep.keys()):
@@ -1340,30 +1405,44 @@ def print_pairs_summary_topology_first_ep(
             print(f"  ├─ Episode: {ep_name}")
             for scen_name in sorted(scen_map.keys()):
                 bundle = scen_map[scen_name]
-                flag  = "OK" if bundle["checks"]["delta_match"] else "FAIL"
-                K     = bundle["K"]
-                Delta = bundle["Delta"]
-                msg   = bundle["checks"]["message"]
+                checks = bundle["checks"]
+                flag   = "OK" if (checks["delta_match"] and checks["env_servers_match"]) else "FAIL"
+                K      = bundle["K"]
+                Delta  = bundle["Delta"]
+                msg    = checks["message"]
                 print(f"  │    - [{flag}] {scen_name:9s} | K={K:2d}  Δ={Delta:g}  -> {msg}")
                 
+                
+# --- Example driver (using current variables) ---
+result_align = align_all_units(
+    datasets_ep_first=datasets,
+    topologies_by_name=topologies,
+    environment=environment
+)
 
-# --- Example driver (with your current variables) ---
-result_align = align_all_units_episode_first(datasets_ep_first=datasets,
-                                             topologies_by_name=topologies)
-
-datasets_aligned = result_align["datasets_aligned"]
+datasets_aligned    = result_align["datasets_aligned"]
+environment_aligned = result_align["environment_aligned"]
 
 pairs_by_topology = build_topology_episode_pairs(
     datasets_ep_first=datasets_aligned,
     topologies=topologies,
-    strict_delta_match=True
+    environment=environment_aligned,
+    strict_delta_match=True,
+    strict_env_match=True
 )
 
 print_pairs_summary_topology_first_ep(pairs_by_topology)
 
 print("\n ===EXAMPLE===")
-tasks_light = pairs_by_topology["full_mesh"]["ep_000"]["light"]["dataset"]["tasks"]
+# Example access:
+#   - tasks for light scenario under fully_connected topology and ep_000
+tasks_light = pairs_by_topology["fully_connected"]["ep_000"]["light"]["dataset"]["tasks"]
+
+#   - connection matrix for clustered topology and heavy scenario, ep_000
 cm_clustered = pairs_by_topology["clustered"]["ep_000"]["heavy"]["connection_matrix_df"]
+
+#   - aligned environment for the same pair
+env_for_pair = pairs_by_topology["clustered"]["ep_000"]["heavy"]["environment"]
 
 
 
