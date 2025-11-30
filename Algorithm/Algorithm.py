@@ -2135,26 +2135,41 @@ def _quantile_cutpoints(s: pd.Series, q_low=0.33, q_high=0.66) -> Tuple[float, f
     return (float(s.quantile(q_low)), float(s.quantile(q_high)))
 
 def _bucketize(value: float, q1: float, q2: float) -> str:
-    # Returns 'S', 'M', 'L' based on two cut points (q1<=q2)
+    """
+    Map a scalar value into a bucket:
+      - 'S' = small
+      - 'M' = medium
+      - 'L' = large
+      - 'U' = unknown (if any input is non-finite)
+    """
     if not np.isfinite(value) or not np.isfinite(q1) or not np.isfinite(q2):
         return "U"  # Unknown
-    if value <= q1: return "S"
-    if value <= q2: return "M"
+    if value <= q1:
+        return "S"
+    if value <= q2:
+        return "M"
     return "L"
 
 # ---------- threshold builder (adaptive to each tasks DF) ----------
-def build_task_label_thresholds(tasks_df: pd.DataFrame,
-                                q_low=0.33, q_high=0.66,
-                                urgent_slots_cap: int = 2) -> Dict[str, Any]:
+def build_task_label_thresholds(
+    tasks_df: pd.DataFrame,
+    q_low: float = 0.33,
+    q_high: float = 0.66,
+    urgent_slots_cap: int = 2,
+) -> Dict[str, Any]:
     """
-    Build adaptive thresholds from the data itself (per-episode/senario),
+    Build adaptive thresholds from the data itself (per-episode/scenario),
     so 'light/moderate/heavy' are handled robustly.
     """
-    q_b_mb   = _quantile_cutpoints(tasks_df["b_mb"], q_low, q_high) if "b_mb" in tasks_df else (np.nan, np.nan)
-    q_rho    = _quantile_cutpoints(tasks_df["rho_cyc_per_mb"], q_low, q_high) if "rho_cyc_per_mb" in tasks_df else (np.nan, np.nan)
-    q_mem    = _quantile_cutpoints(tasks_df["mem_mb"], q_low, q_high) if "mem_mb" in tasks_df else (np.nan, np.nan)
-    q_split  = _quantile_cutpoints(tasks_df.loc[tasks_df.get("non_atomic", 0)==1, "split_ratio"], q_low, q_high) \
-               if "split_ratio" in tasks_df else (np.nan, np.nan)
+    q_b_mb  = _quantile_cutpoints(tasks_df["b_mb"], q_low, q_high) if "b_mb" in tasks_df else (np.nan, np.nan)
+    q_rho   = _quantile_cutpoints(tasks_df["rho_cyc_per_mb"], q_low, q_high) if "rho_cyc_per_mb" in tasks_df else (np.nan, np.nan)
+    q_mem   = _quantile_cutpoints(tasks_df["mem_mb"], q_low, q_high) if "mem_mb" in tasks_df else (np.nan, np.nan)
+
+    if "split_ratio" in tasks_df.columns:
+        mask_split = tasks_df.get("non_atomic", 0) == 1
+        q_split = _quantile_cutpoints(tasks_df.loc[mask_split, "split_ratio"], q_low, q_high)
+    else:
+        q_split = (np.nan, np.nan)
 
     return {
         "b_mb":   {"q1": q_b_mb[0],  "q2": q_b_mb[1]},
@@ -2166,24 +2181,31 @@ def build_task_label_thresholds(tasks_df: pd.DataFrame,
     }
 
 # ---------- main labeling for a single tasks DF ----------
-def label_tasks_df(tasks_df: pd.DataFrame, Delta: float, thresholds: Dict[str, Any]) -> pd.DataFrame:
+def label_tasks_df(
+    tasks_df: pd.DataFrame,
+    Delta: float,
+    thresholds: Dict[str, Any]
+) -> pd.DataFrame:
     """
     Add label columns to tasks_df (returns a COPY).
+
     Columns added:
       - size_bucket, compute_bucket, mem_bucket
-      - deadline_slots (if missing), urgency (none/soft/hard)
+      - (if missing) deadline_slots, and then urgency: none/soft/hard
       - atomicity, split_bucket
       - latency_sensitive, compute_heavy, io_heavy, memory_heavy (bools)
-      - routing_hint (LOCAL/MEC/CLOUD)
+      - routing_hint (LOCAL/MEC/CLOUD) – only for EDA / debugging
     """
     df = tasks_df.copy()
 
-    # --- ensure numeric types
+    # --- ensure numeric types for main features
     for col in ["b_mb", "rho_cyc_per_mb", "c_cycles", "mem_mb", "deadline_s", "split_ratio"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # --- deadline_slots (if not precomputed in Units Alignment)
+    # --- deadline_slots (only if not precomputed earlier)
+    # In our current pipeline, Units Alignment already created `deadline_slots`
+    # and used -1 as sentinel for "no deadline".
     if "deadline_slots" not in df.columns:
         if "has_deadline" in df.columns and "deadline_s" in df.columns:
             df["deadline_slots"] = np.where(
@@ -2195,13 +2217,22 @@ def label_tasks_df(tasks_df: pd.DataFrame, Delta: float, thresholds: Dict[str, A
             df["deadline_slots"] = np.nan
 
     # --- bucketize size/compute/memory
-    b_q1, b_q2   = thresholds["b_mb"]["q1"], thresholds["b_mb"]["q2"]
-    rho_q1, rho_q2 = thresholds["rho"]["q1"], thresholds["rho"]["q2"]
-    mem_q1, mem_q2 = thresholds["mem"]["q1"], thresholds["mem"]["q2"]
+    b_q1, b_q2       = thresholds["b_mb"]["q1"],  thresholds["b_mb"]["q2"]
+    rho_q1, rho_q2   = thresholds["rho"]["q1"],   thresholds["rho"]["q2"]
+    mem_q1, mem_q2   = thresholds["mem"]["q1"],   thresholds["mem"]["q2"]
 
-    df["size_bucket"]    = df["b_mb"].apply(lambda x: _bucketize(x, b_q1, b_q2)) if "b_mb" in df else "U"
-    df["compute_bucket"] = df["rho_cyc_per_mb"].apply(lambda x: _bucketize(x, rho_q1, rho_q2)) if "rho_cyc_per_mb" in df else "U"
-    df["mem_bucket"]     = df["mem_mb"].apply(lambda x: _bucketize(x, mem_q1, mem_q2)) if "mem_mb" in df else "U"
+    df["size_bucket"] = (
+        df["b_mb"].apply(lambda x: _bucketize(x, b_q1, b_q2))
+        if "b_mb" in df else "U"
+    )
+    df["compute_bucket"] = (
+        df["rho_cyc_per_mb"].apply(lambda x: _bucketize(x, rho_q1, rho_q2))
+        if "rho_cyc_per_mb" in df else "U"
+    )
+    df["mem_bucket"] = (
+        df["mem_mb"].apply(lambda x: _bucketize(x, mem_q1, mem_q2))
+        if "mem_mb" in df else "U"
+    )
 
     # --- atomicity & split buckets
     if "non_atomic" in df.columns:
@@ -2221,13 +2252,27 @@ def label_tasks_df(tasks_df: pd.DataFrame, Delta: float, thresholds: Dict[str, A
 
     # --- urgency levels
     urgent_cap = int(thresholds.get("urgent_slots_cap", 2))
+
     def _urg(row):
-        if int(row.get("has_deadline", 0)) != 1 or not np.isfinite(row.get("deadline_slots", np.nan)):
+        # `deadline_slots` in our pipeline:
+        #   - positive integer => has a valid deadline
+        #   - 0 or negative    => sentinel (no deadline)
+        has_deadline_flag = int(row.get("has_deadline", 0)) == 1
+        slots_val = row.get("deadline_slots", -1)
+
+        # Try to cast to int; if it fails, treat as "no deadline"
+        try:
+            slots = int(slots_val)
+        except Exception:
             return "none"
-        slots = int(row["deadline_slots"])
-        if slots <= urgent_cap:  # very tight deadline
+
+        if (not has_deadline_flag) or (slots <= 0):
+            return "none"
+
+        if slots <= urgent_cap:  # very tight deadline → hard
             return "hard"
         return "soft"
+
     df["urgency"] = df.apply(_urg, axis=1)
 
     # --- boolean convenience labels
@@ -2236,45 +2281,56 @@ def label_tasks_df(tasks_df: pd.DataFrame, Delta: float, thresholds: Dict[str, A
     df["io_heavy"]          = (df["size_bucket"] == "L")
     df["memory_heavy"]      = (df["mem_bucket"] == "L")
 
-    # --- a very simple routing hint (only for debugging/EDA; not used by the RL policy)
+    # --- a very simple routing hint (for EDA only; not used by RL)
     def _hint(row):
         if row["compute_heavy"] or row["memory_heavy"]:
             return "CLOUD"
         if row["latency_sensitive"]:
             return "MEC"
         return "LOCAL"
+
     df["routing_hint"] = df.apply(_hint, axis=1)
 
     return df
 
-# ---------- batch apply to env_configs (topology → episode → scenario) ----------
-def label_all_tasks_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, Any]]],
-                                   q_low=0.33, q_high=0.66, urgent_slots_cap=2,
-                                   verbose=True) -> Dict[str, Dict[str, Dict[str, Any]]]:
+# ---------- batch apply to env_configs (episode → topology → scenario) ----------
+def label_all_tasks_in_env_configs(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    q_low: float = 0.33,
+    q_high: float = 0.66,
+    urgent_slots_cap: int = 2,
+    verbose: bool = True
+) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]],
+           Dict[str, Dict[str, Dict[str, Any]]]]:
     """
-    For each env_config:
+    For each env_config (episode → topology → scenario):
       - build thresholds from its own tasks DF
       - label tasks
       - put labeled DF back into env_config["tasks"]
       - return a concise summary per bundle
-    """
-    summary = {}
 
-    for topo_name, by_ep in env_configs.items():
-        summary[topo_name] = {}
-        for ep_name, by_scen in by_ep.items():
-            summary[topo_name][ep_name] = {}
+    env_configs structure (as built earlier):
+        env_configs[ep_name][topology_name][scenario_name] = env_config
+    """
+    summary: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for ep_name, by_topo in env_configs.items():
+        summary[ep_name] = {}
+        for topo_name, by_scen in by_topo.items():
+            summary[ep_name][topo_name] = {}
             for scen_name, env_cfg in by_scen.items():
                 tasks = env_cfg["tasks"]
                 Delta = float(env_cfg["Delta"])
 
-                # thresholds adaptive to this bundle
-                th = build_task_label_thresholds(tasks, q_low=q_low, q_high=q_high,
-                                                 urgent_slots_cap=urgent_slots_cap)
-                labeled = label_tasks_df(tasks, Delta=Delta, thresholds=th)
-                env_cfg["tasks"] = labeled  # write back
+                # Build thresholds for this tasks DF
+                th = build_task_label_thresholds(
+                    tasks, q_low=q_low, q_high=q_high, urgent_slots_cap=urgent_slots_cap
+                )
 
-                # tiny summary
+                labeled = label_tasks_df(tasks, Delta=Delta, thresholds=th)
+                env_cfg["tasks"] = labeled  # write back into env_config
+
+                # Small summary
                 cnt = {
                     "n": len(labeled),
                     "urg_hard": int((labeled["urgency"] == "hard").sum()),
@@ -2283,25 +2339,28 @@ def label_all_tasks_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, An
                     "compute_L": int((labeled["compute_bucket"] == "L").sum()),
                     "mem_L": int((labeled["mem_bucket"] == "L").sum()),
                 }
-                summary[topo_name][ep_name][scen_name] = cnt
+                summary[ep_name][topo_name][scen_name] = cnt
 
                 if verbose:
-                    print(f"[label] {topo_name}/{ep_name}/{scen_name} -> "
-                          f"n={cnt['n']}, hard={cnt['urg_hard']}, split={cnt['splittable']}, "
-                          f"sizeL={cnt['size_L']}, compL={cnt['compute_L']}, memL={cnt['mem_L']}")
+                    print(
+                        f"[label] {ep_name}/{topo_name}/{scen_name} -> "
+                        f"n={cnt['n']}, hard={cnt['urg_hard']}, split={cnt['splittable']}, "
+                        f"sizeL={cnt['size_L']}, compL={cnt['compute_L']}, memL={cnt['mem_L']}"
+                    )
 
     return env_configs, summary
 
 
-# env_configs: Produced in Step 6 (structure: episode → topology → scenario)
+# ---- Run labeling on current env_configs (episode → topology → scenario) ----
 env_configs, label_summary = label_all_tasks_in_env_configs(
     env_configs,
-    q_low=0.33, q_high=0.66, urgent_slots_cap=2,  # tunable thresholds
+    q_low=0.33,
+    q_high=0.66,
+    urgent_slots_cap=2,  # tunable
     verbose=True
 )
 
-# Example access:
-print("\n ===EXAMPLE===")
+print("\n ===EXAMPLE (labeled tasks) ===")
 labeled_tasks = env_configs["ep_000"]["clustered"]["heavy"]["tasks"]
 print(labeled_tasks.head())
 print(labeled_tasks.info())
@@ -2313,48 +2372,61 @@ print(labeled_tasks.info())
 # 2.2. Task Type Classification
 
 # Pre-req: tasks already labeled by your previous step: 
-#   size_bucket, compute_bucket, mem_bucket, urgency, atomicity, split_bucket, routing_hint, etc.
+# size_bucket, compute_bucket, mem_bucket, urgency, atomicity, split_bucket, routing_hint, etc.
 
 def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list, str]:
     """
-    Returns (task_type, task_subtype, type_reason, multi_flags, final_flag)
+    Returns (task_type, task_subtype, type_reason, multi_flags, final_flag),
+    where task_type is one of:
+        - 'deadline_hard'
+        - 'latency_sensitive'
+        - 'compute_intensive'
+        - 'data_intensive'
+        - 'general'
     """
-    # Collect boolean flags consistent with your earlier labeling:
-    urgency        = str(row.get("urgency", "none"))         # "hard" | "soft" | "none"
+    # Flags based on previous labeling
+    urgency        = str(row.get("urgency", "none"))     # "hard" | "soft" | "none"
     latency_flag   = (urgency == "hard") or (urgency == "soft")
     hard_deadline  = (urgency == "hard")
 
-    compute_heavy  = bool(row.get("compute_heavy", False))   # compute_bucket == "L"
-    memory_heavy   = bool(row.get("memory_heavy", False))    # mem_bucket == "L"
-    io_heavy       = bool(row.get("io_heavy", False))        # size_bucket == "L"
+    compute_heavy  = bool(row.get("compute_heavy", False))
+    memory_heavy   = bool(row.get("memory_heavy", False))
+    io_heavy       = bool(row.get("io_heavy", False))
     non_atomic     = bool(row.get("atomicity", "atomic") == "splittable")
 
-    # Keep all active signals for audit:
+    # Collect all active traits for audit
     multi_flags = []
-    if hard_deadline:  multi_flags.append("deadline_hard")
-    elif latency_flag: multi_flags.append("deadline_soft")
-    if compute_heavy:  multi_flags.append("compute_heavy")
-    if memory_heavy:   multi_flags.append("memory_heavy")
-    if io_heavy:       multi_flags.append("io_heavy")
-    if non_atomic:     multi_flags.append("splittable")
+    if hard_deadline:
+        multi_flags.append("deadline_hard")
+    elif latency_flag:
+        multi_flags.append("deadline_soft")
+    if compute_heavy:
+        multi_flags.append("compute_heavy")
+    if memory_heavy:
+        multi_flags.append("memory_heavy")
+    if io_heavy:
+        multi_flags.append("io_heavy")
+    if non_atomic:
+        multi_flags.append("splittable")
 
-    # --- Priority resolution (Chapter 4) ---
+    # --- Priority resolution (simple, Chapter-4 style) ---
+
     # 1) Hard deadline dominates everything
     if hard_deadline:
         final_flag = "deadline_hard"
         return ("deadline_hard", "deadline_hard", "hard deadline (tight slots)", multi_flags, final_flag)
 
-    # 2) Latency-sensitive (soft deadlines / delay-sensitive)
+    # 2) Latency-sensitive (soft deadlines)
     if latency_flag:
         final_flag = "latency_sensitive"
         return ("latency_sensitive", "deadline_soft", "delay-sensitive (soft deadline)", multi_flags, final_flag)
 
-    # 3) Compute-intensive (c or rho or mem heavy)
+    # 3) Compute-intensive (compute or memory heavy)
     if compute_heavy or memory_heavy:
         final_flag = "compute_intensive"
         return ("compute_intensive", "compute_or_memory_heavy", "high compute/memory demand", multi_flags, final_flag)
 
-    # 4) Data-intensive (mainly large input size / high IO pressure)
+    # 4) Data-intensive (large input size / IO heavy)
     if io_heavy:
         final_flag = "data_intensive"
         return ("data_intensive", "large_input_bandwidth", "large data volume / IO heavy", multi_flags, final_flag)
@@ -2366,16 +2438,24 @@ def _derive_task_type_row(row: pd.Series) -> tuple[str, str, str, list, str]:
 def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds Chapter-4 level task classes with priority rules into tasks_df (returns a COPY).
+
+    Requires that tasks_df already has:
+        - urgency
+        - compute_heavy
+        - memory_heavy
+        - io_heavy
+        - atomicity
+
     Columns added:
-      - task_type            (5-way class)
-      - task_subtype         (finer descriptor)
-      - type_reason          (short textual rationale)
-      - multi_flags          (list of all active boolean traits)
-      - final_flag           (single flag representing the task's priority class)
+      - task_type       (5-way class)
+      - task_subtype    (finer descriptor)
+      - type_reason     (short textual rationale)
+      - multi_flags     (list of all active boolean traits)
+      - final_flag      (single primary flag)
+      - is_* one-hot convenience columns
     """
     df = tasks_df.copy()
 
-    # Ensure the expected helper columns exist (created in your previous labeling step).
     required_cols = ["urgency", "compute_heavy", "memory_heavy", "io_heavy", "atomicity"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -2390,26 +2470,28 @@ def apply_ch4_task_typing(tasks_df: pd.DataFrame) -> pd.DataFrame:
         out_flags.append(flags)
         out_final_flag.append(final_flag)
 
-    df["task_type"]   = out_type
-    df["task_subtype"]= out_sub
-    df["type_reason"] = out_reason
-    df["multi_flags"] = out_flags
-    df["final_flag"]  = out_final_flag  # Add the final flag to represent the primary category
+    df["task_type"]    = out_type
+    df["task_subtype"] = out_sub
+    df["type_reason"]  = out_reason
+    df["multi_flags"]  = out_flags
+    df["final_flag"]   = out_final_flag
 
-    # For convenience: one-hot view (optional)
-    df["is_general"]            = (df["task_type"] == "general")
-    df["is_deadline_hard"]      = (df["task_type"] == "deadline_hard")
-    df["is_latency_sensitive"]  = (df["task_type"] == "latency_sensitive")
-    df["is_compute_intensive"]  = (df["task_type"] == "compute_intensive")
-    df["is_data_intensive"]     = (df["task_type"] == "data_intensive")
+    # One-hot convenience view
+    df["is_general"]           = (df["task_type"] == "general")
+    df["is_deadline_hard"]     = (df["task_type"] == "deadline_hard")
+    df["is_latency_sensitive"] = (df["task_type"] == "latency_sensitive")
+    df["is_compute_intensive"] = (df["task_type"] == "compute_intensive")
+    df["is_data_intensive"]    = (df["task_type"] == "data_intensive")
 
     return df
 
-def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, Any]]],
-                                     verbose: bool = True) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def apply_task_typing_in_env_configs(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    verbose: bool = True
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    env_configs structure (as we fixed earlier):
-      env_configs[ep_name][topology_name][scenario_name]["tasks"] -> DataFrame
+    env_configs structure (episode-first):
+        env_configs[ep_name][topology_name][scenario_name]["tasks"] -> DataFrame
 
     This function:
       - applies Chapter-4 task typing to every tasks DF
@@ -2427,15 +2509,19 @@ def apply_task_typing_in_env_configs(env_configs: Dict[str, Dict[str, Dict[str, 
                     n = len(enriched)
                     counts = enriched["task_type"].value_counts().to_dict()
                     print(f"[typing] {ep_name}/{topo_name}/{scen_name}  n={n}  → {counts}")
+
     return env_configs
 
 
-# ---- Run typing on your current env_configs (episode → topology → scenario) ----
+# ---- Run typing on current env_configs (episode → topology → scenario) ----
 env_configs = apply_task_typing_in_env_configs(env_configs, verbose=True)
 
-# Example access:
-print("\n ===EXAMPLE===")
-print(env_configs["ep_000"]["clustered"]["heavy"]["tasks"][["task_id","task_type","task_subtype","type_reason","multi_flags", "final_flag"]].head(25))
+print("\n ===EXAMPLE (task typing) ===")
+print(
+    env_configs["ep_000"]["clustered"]["heavy"]["tasks"][
+        ["task_id", "task_type", "task_subtype", "type_reason", "multi_flags", "final_flag"]
+    ].head(25)
+)
 
 
 # none → Tasks that do not have a specific deadline or time sensitivity </br>
@@ -2459,29 +2545,29 @@ print(labeled_tasks_completed.info())
     # task arrival rate, and the distribution of task types it generates. These profiles are later used for 
     # clustering agents and assigning suitable reinforcement learning strategies to each group.
 
-# ---- Helper 1: per-agent per-slot arrival counts ----
-def _per_agent_slot_counts(arrivals_df: pd.DataFrame) -> pd.DataFrame:
+# ---- Helper 1: per-MEC per-slot arrival counts ----
+def _per_mec_slot_counts(arrivals_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Count how many tasks each agent generates in each time slot.
-    This is used to estimate lambda (arrival rate) statistics.
+    Count how many tasks each MEC receives in each time slot.
+    This is used to estimate lambda (arrival rate) statistics per MEC.
     """
-    if not {"agent_id", "t_slot"}.issubset(arrivals_df.columns):
-        raise ValueError("arrivals must contain 'agent_id' and 't_slot'.")
-    grp = arrivals_df.groupby(["agent_id", "t_slot"], as_index=False).size()
+    if not {"mec_id", "t_slot"}.issubset(arrivals_df.columns):
+        raise ValueError("arrivals must contain 'mec_id' and 't_slot'.")
+    grp = arrivals_df.groupby(["mec_id", "t_slot"], as_index=False).size()
     grp.rename(columns={"size": "count"}, inplace=True)
     return grp
 
-# ---- Helper 2: estimate λ-mean and λ-variance per agent (tight dtypes) ----
-def _lambda_stats_from_counts(counts_df: pd.DataFrame, Delta: float) -> pd.DataFrame:
+# ---- Helper 2: estimate λ-mean and λ-variance per MEC ----
+def _lambda_stats_from_counts_mec(counts_df: pd.DataFrame, Delta: float) -> pd.DataFrame:
     """
-    Convert per-slot counts to rate statistics:
+    Convert per-slot counts to rate statistics per MEC:
         lambda_mean = mean(count_per_slot) / Delta
         lambda_var  = var(count_per_slot)  / Delta^2
     """
     if counts_df.empty:
-        return pd.DataFrame(columns=["agent_id", "lambda_mean", "lambda_var", "slots_observed"])
+        return pd.DataFrame(columns=["mec_id", "lambda_mean", "lambda_var", "slots_observed"])
 
-    agg = counts_df.groupby("agent_id")["count"].agg(
+    agg = counts_df.groupby("mec_id")["count"].agg(
         lambda_mean_slot="mean",
         lambda_var_slot="var",
         slots_observed="count"
@@ -2494,49 +2580,64 @@ def _lambda_stats_from_counts(counts_df: pd.DataFrame, Delta: float) -> pd.DataF
     agg["lambda_mean"] = (agg["lambda_mean_slot"] / float(Delta)).astype(float)
     agg["lambda_var"]  = (agg["lambda_var_slot"]  / float(Delta**2)).astype(float)
 
-    return agg[["agent_id", "lambda_mean", "lambda_var", "slots_observed"]]
+    return agg[["mec_id", "lambda_mean", "lambda_var", "slots_observed"]]
 
-# ---- Helper 3: task-type distribution per agent (robust + extra stats) ----
+# ---- Helper 3: task-type distribution per MEC ----
 _TASK_TYPES = ["general", "latency_sensitive", "deadline_hard", "data_intensive", "compute_intensive"]
 
-def _task_distribution_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
+def _task_distribution_per_mec(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute distribution of task types per agent (probabilities sum to 1 for agents with tasks).
-    Also adds light median features useful for clustering: b_mb_med, rho_med, mem_med, hard_share.
+    Compute distribution of task types per MEC (probabilities sum to 1
+    for MECs that actually have tasks).
+
+    Also adds light median features useful for clustering:
+      - b_mb_med, rho_med, mem_med, hard_share
     """
-    if not {"agent_id", "task_type"}.issubset(tasks_df.columns):
-        raise ValueError("tasks must contain 'agent_id' and 'task_type'.")
+    if not {"mec_id", "task_type"}.issubset(tasks_df.columns):
+        raise ValueError("tasks must contain 'mec_id' and 'task_type'.")
 
-    # Raw counts per (agent_id, task_type)
-    cnt = tasks_df.groupby(["agent_id", "task_type"], as_index=False).size()
-    piv = cnt.pivot(index="agent_id", columns="task_type", values="size").fillna(0.0)
-
-    # Ensure all expected classes exist
-    for t in _TASK_TYPES:
-        if t not in piv.columns:
+    if tasks_df.empty:
+        # Empty DF: return an empty frame with all expected columns
+        piv = pd.DataFrame(index=pd.Index([], name="mec_id"))
+        for t in _TASK_TYPES:
             piv[t] = 0.0
+        piv["n_tasks_mec"] = 0.0
+    else:
+        # Raw counts per (mec_id, task_type)
+        cnt = tasks_df.groupby(["mec_id", "task_type"], as_index=False).size()
+        piv = cnt.pivot(index="mec_id", columns="task_type", values="size").fillna(0.0)
 
-    # True count across all seen labels
-    piv["n_tasks_agent"] = piv[_TASK_TYPES].sum(axis=1).astype(float)
+        # Ensure all expected classes exist
+        for t in _TASK_TYPES:
+            if t not in piv.columns:
+                piv[t] = 0.0
+
+        # Total tasks per MEC
+        piv["n_tasks_mec"] = piv[_TASK_TYPES].sum(axis=1).astype(float)
 
     # Probabilities
     for t in _TASK_TYPES:
-        piv[f"P_{t}"] = np.where(piv["n_tasks_agent"] > 0, piv[t] / piv["n_tasks_agent"], 0.0).astype(float)
+        piv[f"P_{t}"] = np.where(
+            piv["n_tasks_mec"] > 0,
+            piv[t] / piv["n_tasks_mec"],
+            0.0
+        ).astype(float)
 
-    # Optional extra features for clustering (guard on availability)
+    # Optional extra features (medians, hard deadline share)
     feats = {}
-    have_feats = {"b_mb", "rho_cyc_per_mb", "mem_mb", "urgency"}
-    if have_feats.issubset(tasks_df.columns):
-        agg = tasks_df.groupby("agent_id").agg(
+    needed = {"b_mb", "rho_cyc_per_mb", "mem_mb", "urgency"}
+    if needed.issubset(tasks_df.columns) and not tasks_df.empty:
+        agg = tasks_df.groupby("mec_id").agg(
             b_mb_med=("b_mb", "median"),
             rho_med=("rho_cyc_per_mb", "median"),
             mem_med=("mem_mb", "median"),
             hard_share=("urgency", lambda s: float((s == "hard").mean()))
         ).reset_index()
-        feats = agg.set_index("agent_id")
+        feats = agg.set_index("mec_id")
 
     # Join extra features (if any)
     piv = piv.join(feats, how="left")
+
     for c in ["b_mb_med", "rho_med", "mem_med", "hard_share"]:
         if c in piv.columns:
             piv[c] = piv[c].fillna(0.0).astype(float)
@@ -2547,131 +2648,144 @@ def _task_distribution_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
     prob_cols = [f"P_{t}" for t in _TASK_TYPES]
     piv["TaskDist_sum"] = piv[prob_cols].sum(axis=1).astype(float)
 
-    keep = ["n_tasks_agent", "TaskDist_sum", "b_mb_med", "rho_med", "mem_med", "hard_share"] + prob_cols
-    return piv[keep].reset_index()
+    keep = ["n_tasks_mec", "TaskDist_sum", "b_mb_med", "rho_med", "mem_med", "hard_share"] + prob_cols
+    return piv[keep].reset_index()  # reset_index → get mec_id as a column
 
-# ---- Helper 4: fraction of non-atomic (splittable) tasks ----
-def _non_atomic_share_per_agent(tasks_df: pd.DataFrame) -> pd.DataFrame:
+# ---- Helper 4: fraction of non-atomic (splittable) tasks per MEC ----
+def _non_atomic_share_per_mec(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute the share of splittable (non-atomic) tasks per agent.
+    Compute the share of splittable (non-atomic) tasks per MEC.
     """
-    if not {"agent_id", "non_atomic"}.issubset(tasks_df.columns):
-        # If missing, assume zero for all agents that exist in tasks
-        agents = tasks_df.get("agent_id")
-        if agents is None or len(agents) == 0:
-            return pd.DataFrame(columns=["agent_id", "non_atomic_share"])
-        return pd.DataFrame({"agent_id": agents.unique(), "non_atomic_share": 0.0})
+    if "mec_id" not in tasks_df.columns:
+        raise ValueError("tasks must contain 'mec_id'.")
 
-    grp = tasks_df.groupby("agent_id")["non_atomic"].agg(
+    if "non_atomic" not in tasks_df.columns or tasks_df.empty:
+        # If missing or no tasks, assume zero share for each MEC that appears
+        mec_ids = tasks_df.get("mec_id")
+        if mec_ids is None or len(mec_ids) == 0:
+            return pd.DataFrame(columns=["mec_id", "non_atomic_share"])
+        return pd.DataFrame({"mec_id": mec_ids.unique(), "non_atomic_share": 0.0})
+
+    grp = tasks_df.groupby("mec_id")["non_atomic"].agg(
         non_atomic_share=lambda s: float((s == 1).mean())
     ).reset_index()
     return grp
 
-# ---- Build agent profiles for ONE env_config ----
-def build_agent_profiles_for_env(env_cfg: Dict[str, Any]) -> pd.DataFrame:
+# ---- Build MEC profiles for ONE env_config ----
+def build_mec_profiles_for_env(env_cfg: Dict[str, Any]) -> pd.DataFrame:
     """
-    Construct per-agent profiles combining:
-      - Local resource capacity (f_local, m_local, f_local_slot)
-      - Arrival rate statistics (lambda_mean, lambda_var)
-      - Task type distribution (P_general, P_latency_sensitive, P_deadline_hard, P_data_intensive, P_compute_intensive)
-      - Splittability share (non_atomic_share)
-      - MEC mapping if available (mec_id)
+    Construct per-MEC profiles combining:
+      - Resource capacities:
+            private_cpu, public_cpu
+            private_cpu_slot, public_cpu_slot (approx: capacity * Delta)
+      - Arrival rate statistics:
+            lambda_mean, lambda_var, slots_observed
+      - Task type distribution:
+            P_general, P_latency_sensitive, P_deadline_hard,
+            P_data_intensive, P_compute_intensive
+            + n_tasks_mec, TaskDist_sum, b_mb_med, rho_med, mem_med, hard_share
+      - Splittability share:
+            non_atomic_share
     """
-    agents   = env_cfg["agents"].copy()
-    arrivals = env_cfg["arrivals"]
     tasks    = env_cfg["tasks"]
+    arrivals = env_cfg["arrivals"]
     Delta    = float(env_cfg["Delta"])
+    K        = int(env_cfg["K"])
 
-    # Ensure cycles/slot exists
-    if "f_local_slot" not in agents.columns and "f_local" in agents.columns:
-        agents["f_local_slot"] = agents["f_local"].astype(float) * Delta
+    # Capacities from topology/env_config
+    private_cpu = np.asarray(env_cfg["private_cpu"], dtype=float)
+    public_cpu  = np.asarray(env_cfg["public_cpu"], dtype=float)
 
-    # 1) Arrival statistics
-    counts_df = _per_agent_slot_counts(arrivals)
-    lam_df    = _lambda_stats_from_counts(counts_df, Delta=Delta)
+    if private_cpu.shape[0] != K or public_cpu.shape[0] != K:
+        raise ValueError("Length of private_cpu/public_cpu must equal K in env_config.")
+
+    # Per-slot capacities (assuming private_cpu/public_cpu are per-second-like units)
+    private_cpu_slot = private_cpu * Delta
+    public_cpu_slot  = public_cpu  * Delta
+
+    # 1) Arrival statistics per MEC
+    counts_df = _per_mec_slot_counts(arrivals)
+    lam_df    = _lambda_stats_from_counts_mec(counts_df, Delta=Delta)
 
     # 2) Task-type distribution (+ medians & hard_share)
-    dist_df   = _task_distribution_per_agent(tasks)
+    dist_df   = _task_distribution_per_mec(tasks)
 
-    # 3) Splittable-task share
-    na_df     = _non_atomic_share_per_agent(tasks)
+    # 3) Splittable-task share per MEC
+    na_df     = _non_atomic_share_per_mec(tasks)
 
-    # 4) Agent→MEC mapping (optional)
-    mec_map = None
-    if "agent_to_mec" in env_cfg:
-        a2m = env_cfg["agent_to_mec"]
-        if isinstance(a2m, pd.Series):
-            mec_map = a2m.rename("mec_id").reset_index()
-            # if the index column name is lost, normalize it
-            if mec_map.columns.tolist() == ["index", "mec_id"]:
-                mec_map.rename(columns={"index": "agent_id"}, inplace=True)
-        else:
-            mec_map = pd.DataFrame({
-                "agent_id": np.arange(len(a2m), dtype=int),
-                "mec_id": np.asarray(a2m, dtype=int)
-            })
+    # Base table: one row per MEC
+    base = pd.DataFrame({
+        "mec_id": np.arange(K, dtype=int),
+        "private_cpu": private_cpu.astype(float),
+        "public_cpu": public_cpu.astype(float),
+        "private_cpu_slot": private_cpu_slot.astype(float),
+        "public_cpu_slot": public_cpu_slot.astype(float),
+    })
 
     # Merge all components
-    base = agents[["agent_id", "f_local", "f_local_slot", "m_local"]].copy()
-    base[["f_local", "f_local_slot", "m_local"]] = base[["f_local", "f_local_slot", "m_local"]].astype(float)
-
     prof = (base
-            .merge(lam_df,  on="agent_id", how="left")
-            .merge(dist_df, on="agent_id", how="left")
-            .merge(na_df,   on="agent_id", how="left"))
+            .merge(lam_df,  on="mec_id", how="left")
+            .merge(dist_df, on="mec_id", how="left")
+            .merge(na_df,   on="mec_id", how="left"))
 
-    if mec_map is not None:
-        prof = prof.merge(mec_map, on="agent_id", how="left")
-
-    # Fill missing for agents with no arrivals/tasks
+    # Fill missing values for MECs with no arrivals/tasks
     fill_zero = [
         "lambda_mean", "lambda_var", "slots_observed",
-        "n_tasks_agent", "non_atomic_share",
+        "n_tasks_mec", "non_atomic_share",
         "TaskDist_sum", "b_mb_med", "rho_med", "mem_med", "hard_share"
     ] + [f"P_{t}" for t in _TASK_TYPES]
+
     for c in fill_zero:
         if c in prof.columns:
             prof[c] = prof[c].fillna(0.0).astype(float)
 
-    # Soft warning if probabilities don't sum to ~1 for agents with tasks
-    if "n_tasks_agent" in prof.columns and "TaskDist_sum" in prof.columns:
-        mask = (prof["n_tasks_agent"] > 0) & (~np.isclose(prof["TaskDist_sum"], 1.0, atol=1e-6))
+    # Soft warning if probabilities don't sum to ~1 for MECs that do have tasks
+    if "n_tasks_mec" in prof.columns and "TaskDist_sum" in prof.columns:
+        mask = (prof["n_tasks_mec"] > 0) & (~np.isclose(prof["TaskDist_sum"], 1.0, atol=1e-6))
         if mask.any():
             n_bad = int(mask.sum())
-            print(f"[warn] TaskDist_sum != 1.0 for {n_bad} agent(s). (tolerance 1e-6)")
+            print(f"[warn] TaskDist_sum != 1.0 for {n_bad} MEC(s). (tolerance 1e-6)")
 
     return prof
 
 # ---- Batch profiling for ALL env_configs ----
-def build_all_agent_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
+def build_all_mec_profiles(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Dict[str, Dict[str, Dict[str, pd.DataFrame]]]:
     """
-    Compute profiles for every (episode → topology → scenario) environment.
-    Stores result both in return dict AND env_configs[...] for convenience.
+    Compute MEC profiles for every (episode → topology → scenario) environment.
+
+    Input:
+        env_configs[ep_name][topology_name][scenario_name]["tasks"] / ["arrivals"] / ...
+
     Output:
-      profiles[ep_name][topology_name][scen_name] = DataFrame
-    Also writes back to: env_configs[ep_name][topology_name][scen_name]["agent_profiles"]
+        mec_profiles[ep_name][topology_name][scen_name] = DataFrame
+
+    Also writes back to:
+        env_configs[ep_name][topology_name][scen_name]["mec_profiles"]
     """
-    out = {}
+    out: Dict[str, Dict[str, Dict[str, pd.DataFrame]]] = {}
+
     for ep_name, by_topo in env_configs.items():
         out[ep_name] = {}
         for topo_name, by_scen in by_topo.items():
             out[ep_name][topo_name] = {}
             for scen_name, env_cfg in by_scen.items():
-                prof = build_agent_profiles_for_env(env_cfg)
+                prof = build_mec_profiles_for_env(env_cfg)
                 out[ep_name][topo_name][scen_name] = prof
-                env_cfg["agent_profiles"] = prof  # attach for direct access
+                env_cfg["mec_profiles"] = prof  # attach for direct access
+
     return out
 
 
 # ---- Build + quick peek (optional) ----
-agent_profiles = build_all_agent_profiles(env_configs)
+mec_profiles = build_all_mec_profiles(env_configs)
 
-# Example: Access the profile table for a specific episode / topology / scenario
-print("\n ===EXAMPLE===")
-print(agent_profiles["ep_000"]["clustered"]["heavy"].head())
+print("\n ===EXAMPLE MEC PROFILES===")
+print(mec_profiles["ep_000"]["clustered"]["heavy"].head())
 
-# Alternatively, read directly from env_configs:
-print(env_configs["ep_000"]["clustered"]["heavy"]["agent_profiles"].head(25))
+# Or directly from env_configs:
+print(env_configs["ep_000"]["clustered"]["heavy"]["mec_profiles"].head(25))
 
 
 ep   = "ep_000"
@@ -2682,9 +2796,10 @@ env_cfg = env_configs[ep][topo][scen]
 
 print(env_cfg.keys())
 
-prof = env_cfg["agent_profiles"]
+prof = env_cfg["mec_profiles"]
 print(prof.head())
 print(prof.columns)
+
 
 
 # Saving Information
