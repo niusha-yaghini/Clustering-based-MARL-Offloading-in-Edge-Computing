@@ -1,0 +1,2 @@
+scenario,episode_id,Delta,T_slots,T_decision,T_drain,hours,N_mecs,seed
+heavy,0,1.0,110,100,10,0.030555556,20,345

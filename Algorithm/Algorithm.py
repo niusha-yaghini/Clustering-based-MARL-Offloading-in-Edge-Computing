@@ -2915,197 +2915,248 @@ print(prof.columns)
 # 
 # The resulting matrix (X) is used for clustering agents in Step 4.2.
 
-AGENT_FEATURES_V1 = [
-    # ---- (1) Local resources ----
-    "f_local_slot",   # Local CPU cycles per slot
-    "m_local",        # Local memory capacity
-    "lambda_mean",    # Mean task arrival rate
-    "lambda_var",     # Variance of task arrival rate
+MEC_FEATURES_V1 = [
+    # ---- (1) Local resources / capacities ----
+    "private_cpu_slot",     # Private CPU cycles per slot
+    "public_cpu_slot",      # Public CPU cycles per slot
 
-    # ---- (2) Task generation pattern ----
-    # Derived from labeled task distribution across final_flag categories
+    # ---- (2) Arrival statistics ----
+    "lambda_mean",          # Mean task arrival rate (tasks / second)
+    "lambda_var",           # Variance of task arrival rate
+
+    # ---- (3) Task generation pattern (probabilities over types) ----
     "P_deadline_hard",
     "P_latency_sensitive",
     "P_compute_intensive",
     "P_data_intensive",
     "P_general",
 
-    # ---- (optional statistical descriptors of generated tasks) ----
-    "b_mb_med",       # Median input size
-    "rho_med",        # Median compute demand (cycles/MB)
-    "mem_med",        # Median memory demand (MB)
-    "non_atomic_share", # Share of splittable tasks
-    "hard_share"        # Share of hard-deadline tasks
+    # ---- (4) Statistical descriptors of tasks handled by this MEC ----
+    "b_mb_med",             # Median input size
+    "rho_med",              # Median compute demand (cycles / MB)
+    "mem_med",              # Median memory demand (MB)
+    "non_atomic_share",     # Share of splittable tasks
+    "hard_share",           # Share of hard-deadline tasks
 ]
 
-# Features that need normalization
+# Features to standardize (others like probabilities are already 0–1)
 FEATURES_TO_STANDARDIZE = [
-    "f_local_slot",   # Local CPU cycles per slot
-    "m_local",        # Local memory capacity
-    "lambda_mean",    # Mean task arrival rate
-    "lambda_var",     # Variance of task arrival rate
-    "b_mb_med",       # Median input size
-    "rho_med",        # Median compute demand (cycles/MB)
-    "mem_med",        # Median memory demand (MB)
+    "private_cpu_slot",
+    "public_cpu_slot",
+    "lambda_mean",
+    "lambda_var",
+    "b_mb_med",
+    "rho_med",
+    "mem_med",
 ]
 
-# Utility: Keep only existing columns; others will be filled with zeros
+# --------------------------------------------
+# Utility: keep only existing columns
+# --------------------------------------------
 def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    """Return only those columns from 'cols' that actually exist in df."""
     return [c for c in cols if c in df.columns]
 
-# Normalize features that need normalization
-def normalize_features(X: np.ndarray, cols: List[str], feature_list: List[str]) -> np.ndarray:
-    # Identify which columns need to be standardized
+# --------------------------------------------
+# Normalize selected feature columns
+# --------------------------------------------
+def normalize_features(
+    X: np.ndarray,
+    cols: List[str],
+    feature_list: List[str]
+) -> np.ndarray:
+    """
+    Apply standardization (zero mean, unit variance) only to selected columns.
+    """
     standardize_cols = [col for col in feature_list if col in FEATURES_TO_STANDARDIZE]
     if len(standardize_cols) > 0:
-        # Apply scaling only to the columns that need standardization
         scaler = StandardScaler()
-        col_indices = [cols.index(col) for col in standardize_cols]
-        X[:, col_indices] = scaler.fit_transform(X[:, col_indices])
+        col_indices = [cols.index(col) for col in standardize_cols if col in cols]
+        if col_indices:
+            X[:, col_indices] = scaler.fit_transform(X[:, col_indices])
     return X
 
-# Build feature matrix for one environment configuration
-def make_agent_feature_matrix_for_env(
+# --------------------------------------------
+# Build MEC feature matrix for one env_config
+# --------------------------------------------
+def make_mec_feature_matrix_for_env(
     env_cfg: Dict[str, Any],
     feature_list: Optional[List[str]] = None,
     standardize: bool = True,
 ) -> Tuple[np.ndarray, List[str], np.ndarray]:
     """
-    Build the feature matrix (X) for all agents in one environment configuration.
-    Each row represents an agent; each column a numerical feature.
-    
-    Returns:
-        X_scaled       : np.ndarray (n_agents × n_features)
-        used_cols      : list of feature names in order
-        agent_ids      : np.ndarray of agent identifiers
-    """
-    if "agent_profiles" not in env_cfg or not isinstance(env_cfg["agent_profiles"], pd.DataFrame):
-        raise ValueError("env_cfg['agent_profiles'] must contain a valid DataFrame.")
+    Build the feature matrix (X) for all MECs in one environment configuration.
+    Each row represents a MEC; each column a numerical feature.
 
-    prof = env_cfg["agent_profiles"].copy()
-    if "agent_id" not in prof.columns:
-        raise ValueError("agent_profiles must include column 'agent_id'.")
+    Returns:
+        X_scaled   : np.ndarray (n_mecs × n_features)
+        used_cols  : list of feature names in order
+        mec_ids    : np.ndarray of MEC identifiers
+    """
+    if "mec_profiles" not in env_cfg or not isinstance(env_cfg["mec_profiles"], pd.DataFrame):
+        raise ValueError("env_cfg['mec_profiles'] must contain a valid DataFrame.")
+
+    prof = env_cfg["mec_profiles"].copy()
+    if "mec_id" not in prof.columns:
+        raise ValueError("mec_profiles must include column 'mec_id'.")
 
     if feature_list is None:
-        feature_list = AGENT_FEATURES_V1
+        feature_list = MEC_FEATURES_V1
 
-    # Keep valid features and fill missing ones with zeros
+    # Keep valid features and fill missing values with zeros
     cols = _safe_cols(prof, feature_list)
     X = prof.reindex(columns=cols).fillna(0.0).astype(float).to_numpy()
-    agent_ids = prof["agent_id"].to_numpy(dtype=int)
+    mec_ids = prof["mec_id"].to_numpy(dtype=int)
 
-    # Standardize only the required features
+    # Standardize selected features
     if standardize:
         X = normalize_features(X, cols, feature_list)
 
-    return X, cols, agent_ids
+    return X, cols, mec_ids
 
-# Attach computed features to the environment configuration
-def attach_features_to_env(env_cfg: Dict[str, Any],
-                           feature_list: Optional[List[str]] = None,
-                           standardize: bool = True) -> Dict[str, Any]:
+# --------------------------------------------
+# Attach MEC features to a single env_config
+# --------------------------------------------
+def attach_mec_features_to_env(
+    env_cfg: Dict[str, Any],
+    feature_list: Optional[List[str]] = None,
+    standardize: bool = True
+) -> Dict[str, Any]:
     """
-    Attach the constructed feature matrix and related metadata
-    to env_cfg["clustering"]["features"]. 
+    Attach the constructed MEC feature matrix and metadata to:
+        env_cfg["clustering"]["features"]
     """
-    X, cols, agent_ids = make_agent_feature_matrix_for_env(env_cfg, feature_list, standardize)
+    X, cols, mec_ids = make_mec_feature_matrix_for_env(env_cfg, feature_list, standardize)
 
     env_cfg.setdefault("clustering", {})
     env_cfg["clustering"]["features"] = {
-        "X": X,                          # Feature matrix (scaled)
-        "feature_cols": cols,            # List of column names
-        "agent_ids": agent_ids,          # Agent identifiers
-        "n_agents": int(X.shape[0]),
+        "X": X,                      # Feature matrix (possibly standardized)
+        "feature_cols": cols,        # List of feature names
+        "mec_ids": mec_ids,          # MEC identifiers
+        "n_mecs": int(X.shape[0]),
         "n_features": int(X.shape[1]),
     }
     return env_cfg
 
-# Apply feature construction to all topology-scenario combinations
-def attach_features_to_all_envs(
+# --------------------------------------------
+# Apply feature construction to all envs
+# --------------------------------------------
+def attach_mec_features_to_all_envs(
     env_configs: Dict[str, Dict[str, Dict[str, Any]]],
     feature_list: Optional[List[str]] = None,
     standardize: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     Iterate through all (episode → topology → scenario) combinations
-    and build the feature matrix for each one.
+    and build the MEC feature matrix for each one.
     """
     for ep_name, by_topo in env_configs.items():
         for topo_name, by_scen in by_topo.items():
             for scen_name, env_cfg in by_scen.items():
-                env_configs[ep_name][topo_name][scen_name] = attach_features_to_env(
+                env_configs[ep_name][topo_name][scen_name] = attach_mec_features_to_env(
                     env_cfg, feature_list, standardize
                 )
                 fz = env_configs[ep_name][topo_name][scen_name]["clustering"]["features"]
-                print(f"[features] {ep_name}/{topo_name}/{scen_name} "
-                      f"-> X.shape={fz['X'].shape}  (agents={fz['n_agents']}, feats={fz['n_features']})")
+                print(
+                    f"[features] {ep_name}/{topo_name}/{scen_name} "
+                    f"-> X.shape={fz['X'].shape}  (mecs={fz['n_mecs']}, feats={fz['n_features']})"
+                )
     return env_configs
 
 
+
+# --------------------------------------------
+# Sanity checks
+# --------------------------------------------
 def _assert_no_nan_inf(X: np.ndarray, where: str):
     if not np.isfinite(X).all():
-        bad = np.isnan(X).sum(), np.isinf(X).sum()
-        raise AssertionError(f"{where}: Feature matrix contains NaN or Inf. counts={bad}")
+        n_nan = int(np.isnan(X).sum())
+        n_inf = int(np.isinf(X).sum())
+        raise AssertionError(f"{where}: Feature matrix contains NaN or Inf. counts=(NaN={n_nan}, Inf={n_inf})")
 
-def _assert_agent_count_match(env_cfg: Dict[str, Any], where: str):
-    n_agents_ep = int(env_cfg["episodes"]["N_agents"].iloc[0])
-    n_agents_prof = len(env_cfg["agent_profiles"])
+def _assert_mec_count_match(env_cfg: Dict[str, Any], where: str):
+    """
+    Check that:
+      - episodes.N_mecs
+      - mec_profiles rows
+      - feature matrix rows
+    all match.
+    """
+    if "episodes" not in env_cfg or "mec_profiles" not in env_cfg:
+        raise AssertionError(f"{where}: Missing episodes or mec_profiles in env_cfg.")
+
+    n_mecs_ep = int(env_cfg["episodes"]["N_mecs"].iloc[0])
+    n_mecs_prof = len(env_cfg["mec_profiles"])
     fz = env_cfg["clustering"]["features"]
-    if not (fz["n_agents"] == n_agents_prof == n_agents_ep):
+    n_mecs_X = fz["n_mecs"]
+
+    if not (n_mecs_X == n_mecs_prof == n_mecs_ep):
         raise AssertionError(
-            f"{where}: Agent count mismatch. episodes={n_agents_ep}, "
-            f"profiles={n_agents_prof}, X={fz['n_agents']}"
+            f"{where}: MEC count mismatch. episodes={n_mecs_ep}, "
+            f"profiles={n_mecs_prof}, X={n_mecs_X}"
         )
 
-def _assert_feature_prob_sum_hint(env_cfg: Dict[str, Any], tol=1e-3):
-    prof = env_cfg["agent_profiles"]
-    if "TaskDist_sum" in prof.columns and "n_tasks_agent" in prof.columns:
-        mask = prof["n_tasks_agent"] > 0
+def _assert_feature_prob_sum_hint_mec(env_cfg: Dict[str, Any], tol: float = 1e-3):
+    """
+    Hint check: for MECs that have tasks, TaskDist_sum ≈ 1 on average.
+    """
+    prof = env_cfg["mec_profiles"]
+    if "TaskDist_sum" in prof.columns and "n_tasks_mec" in prof.columns:
+        mask = prof["n_tasks_mec"] > 0
         if mask.any():
             mean_sum = float(prof.loc[mask, "TaskDist_sum"].mean())
             if abs(mean_sum - 1.0) > tol:
                 print(f"[warn] Mean(TaskDist_sum)={mean_sum:.4f} ≠ 1 (tol={tol})")
 
-def run_feature_matrix_sanity_checks(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
+def run_mec_feature_matrix_sanity_checks(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]]
+):
+    """
+    Run sanity checks over all MEC feature matrices in env_configs.
+    """
     for ep_name, by_topo in env_configs.items():
         for topo_name, by_scen in by_topo.items():
             for scen_name, env_cfg in by_scen.items():
                 where = f"{ep_name}/{topo_name}/{scen_name}"
                 if "clustering" not in env_cfg or "features" not in env_cfg["clustering"]:
-                    raise AssertionError(f"{where}: Missing features.")
+                    raise AssertionError(f"{where}: Missing clustering.features.")
                 X = env_cfg["clustering"]["features"]["X"]
                 _assert_no_nan_inf(X, where)
-                _assert_agent_count_match(env_cfg, where)
-                _assert_feature_prob_sum_hint(env_cfg)
+                _assert_mec_count_match(env_cfg, where)
+                _assert_feature_prob_sum_hint_mec(env_cfg)
                 if X.shape[1] == 0:
                     raise AssertionError(f"{where}: Empty feature matrix.")
-    print("[checks] All sanity checks passed successfully.")
-            
+    print("[checks] All MEC feature matrices passed sanity checks.")
+                
 
 # Build feature matrices for all envs
-env_configs = attach_features_to_all_envs(env_configs, feature_list=AGENT_FEATURES_V1, standardize=True)
+env_configs = attach_mec_features_to_all_envs(
+    env_configs,
+    feature_list=MEC_FEATURES_V1,
+    standardize=True
+)
 
 # Run sanity checks
-run_feature_matrix_sanity_checks(env_configs)
+run_mec_feature_matrix_sanity_checks(env_configs)
 
 # Example inspection
-print("\n=== EXAMPLE: features of ep_000 / clustered / heavy ===")
+print("\n=== EXAMPLE: MEC features of ep_000 / clustered / heavy ===")
 fz = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["features"]
 print("X.shape:", fz["X"].shape)
 print("feature_cols:", fz["feature_cols"])
-print("agent_ids (first 10):", fz["agent_ids"][:10])
+print("mec_ids (first 10):", fz["mec_ids"][:10])
 
 
 print("missing features:",
-      [c for c in AGENT_FEATURES_V1 if c not in prof.columns])
+      [c for c in MEC_FEATURES_V1 if c not in prof.columns])
 
-print(prof[ [c for c in AGENT_FEATURES_V1 if c in prof.columns] ].head())
+print(prof[ [c for c in MEC_FEATURES_V1 if c in prof.columns] ].head())
 
 
 fz = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["features"]
 print("X.shape:", fz["X"].shape)
 print("feature_cols actually used:", fz["feature_cols"])
-print("agent_ids[:10]:", fz["agent_ids"][:10])
+print("mec_ids[:10]:", fz["mec_ids"][:10])
 
 
 
@@ -3115,23 +3166,23 @@ print("agent_ids[:10]:", fz["agent_ids"][:10])
 
 # ---------- 4.2.1 Candidate K values ----------
 def _candidate_K_values(
-    n_agents: int,
+    n_mecs: int,
     k_min: int = 2,
     max_K_fraction: float = 0.25,
     max_K_abs: int = 10
 ) -> List[int]:
     """
-    Build a reasonable candidate set for K given n_agents.
+    Build a reasonable candidate set for K given n_mecs.
 
     - Lower bound is k_min (default 2).
-    - Upper bound is min(max_K_abs, floor(max_K_fraction * n_agents), n_agents - 1).
-    - If n_agents is too small, returns an empty list.
+    - Upper bound is min(max_K_abs, floor(max_K_fraction * n_mecs), n_mecs - 1).
+    - If n_mecs is too small, returns an empty list.
     """
-    if n_agents <= k_min:
+    if n_mecs <= k_min:
         return []
 
-    k_max_by_fraction = int(np.floor(max_K_fraction * n_agents))
-    k_max = min(max_K_abs, n_agents - 1, max(k_min, k_max_by_fraction))
+    k_max_by_fraction = int(np.floor(max_K_fraction * n_mecs))
+    k_max = min(max_K_abs, n_mecs - 1, max(k_min, k_max_by_fraction))
 
     if k_max < k_min:
         return []
@@ -3212,7 +3263,6 @@ def _min_max_normalize(
 
     - If all values are NaN or the range is zero, returns NaN array.
     - If invert=True, larger original values map to lower normalized ones.
-      (Useful if 'smaller is better' in the original metric.)
     """
     arr = np.asarray(arr, dtype=float)
     if np.all(np.isnan(arr)):
@@ -3396,12 +3446,12 @@ def step4_2_select_K_for_all_envs(
     verbose: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    Step 4.2: K-selection for all environments.
+    Step 4.2: K-selection for all environments (MEC clustering).
 
     For each:
         env_configs[ep_name][topology_name][scenario_name]["clustering"]["features"]["X"]
     we:
-      - build candidate K list
+      - build candidate K list (based on n_mecs = X.shape[0])
       - run KMeans for each K
       - compute metrics + composite score
       - compute elbow_score
@@ -3439,12 +3489,12 @@ def step4_2_select_K_for_all_envs(
                               f"empty or invalid feature matrix.")
                     continue
 
-                n_agents = X.shape[0]
-                K_candidates = _candidate_K_values(n_agents)
+                n_mecs = X.shape[0]
+                K_candidates = _candidate_K_values(n_mecs)
                 if not K_candidates:
                     if verbose:
                         print(f"[4.2/skip] {ep_name}/{topo_name}/{scen_name}: "
-                              f"not enough agents for clustering (n_agents={n_agents}).")
+                              f"not enough MECs for clustering (n_mecs={n_mecs}).")
                     continue
 
                 # 1) Evaluate KMeans for all candidate K
@@ -3496,7 +3546,7 @@ def step4_2_select_K_for_all_envs(
 
                 if verbose:
                     print(f"[4.2] {ep_name}/{topo_name}/{scen_name}: "
-                          f"n_agents={n_agents}, candidates={K_candidates}")
+                          f"n_mecs={n_mecs}, candidates={K_candidates}")
                     print(f"      → best_K  (composite score) = {best_K}")
                     print(f"      → K_elbow (inertia elbow)    = {K_elbow}")
                     print(f"      → elbow plot saved at: {elbow_plot_path}")
@@ -3511,7 +3561,7 @@ def step4_2_select_K_for_all_envs(
 
 
 # ---------- 4.2.9 Example driver ----------
-# After Step 4.1 (attach_features_to_all_envs + sanity checks), run:
+# After Step 4.1 (attach_mec_features_to_all_envs + sanity checks), run:
 K_selection = step4_2_select_K_for_all_envs(
     env_configs,
     random_state=42,
@@ -3541,7 +3591,8 @@ if (ex_ep in K_selection and
         ].round(4)
     )
 else:
-    print("[warn] Example triple (ep_000/clustered/heavy) not found in K_selection.")        
+    print("[warn] Example triple (ep_000/clustered/heavy) not found in K_selection.")
+        
     
     
 # The checkups !!! (the charts are alike)
@@ -3559,12 +3610,12 @@ print("X_light vs X_mod   allclose:", np.allclose(X_light, X_mod))
 print("shapes:", X_light.shape, X_mod.shape, X_heavy.shape)
 
 
-prof_light = env_configs[ep][topo]["light"]["agent_profiles"]
-prof_mod   = env_configs[ep][topo]["moderate"]["agent_profiles"]
-prof_heavy = env_configs[ep][topo]["heavy"]["agent_profiles"]
+prof_light = env_configs[ep][topo]["light"]["mec_profiles"]
+prof_mod   = env_configs[ep][topo]["moderate"]["mec_profiles"]
+prof_heavy = env_configs[ep][topo]["heavy"]["mec_profiles"]
 
-print("profiles equal (light vs heavy):", prof_light.equals(prof_heavy))
-print("profiles equal (light vs mod)  :", prof_light.equals(prof_mod))
+print("MEC profiles equal (light vs heavy):", prof_light.equals(prof_heavy))
+print("MEC profiles equal (light vs mod)  :", prof_light.equals(prof_mod))
 
 
 
@@ -3577,30 +3628,47 @@ targets = [
 
 for topo, scen in targets:
     print(f"\n=== {ep} / {topo} / {scen} ===")
-    prof = env_configs[ep][topo][scen]["agent_profiles"]
+    prof = env_configs[ep][topo][scen]["mec_profiles"]
 
-    print("\nlambda stats:")
+    print("\nλ (arrival rate) stats per MEC:")
     print(prof[["lambda_mean", "lambda_var"]].describe())
 
-    print("\nP(task_type) stats:")
-    cols_p = [f"P_{t}" for t in ["deadline_hard","latency_sensitive",
-                                  "compute_intensive","data_intensive","general"]]
-    print(prof[cols_p].describe())
+    print("\nP(task_type) stats per MEC:")
+    cols_p = [f"P_{t}" for t in [
+        "deadline_hard",
+        "latency_sensitive",
+        "compute_intensive",
+        "data_intensive",
+        "general"
+    ]]
+    existing_p = [c for c in cols_p if c in prof.columns]
+    print(prof[existing_p].describe())
 
-    print("\nmedian task resource stats:")
-    print(prof[["b_mb_med","rho_med","mem_med"]].describe())
+    print("\nmedian task resource stats per MEC:")
+    cols_med = [c for c in ["b_mb_med","rho_med","mem_med"] if c in prof.columns]
+    print(prof[cols_med].describe())    
     
-    
+
 
 # 3. metrics similarity
-for topo in ["clustered", "full_mesh", "sparse_ring"]:
-    for scen in ["light", "moderate", "heavy"]:
-        sel = K_selection["ep_000"][topo][scen]
-        dfm = sel["metrics_df"]
-        print(f"\n=== {topo} / {scen} ===")
-        print(dfm[["K","inertia","silhouette",
-                   "calinski_harabasz","davies_bouldin","score"]].round(4))        
-        
+if ep not in K_selection:
+    print(f"[warn] episode {ep} not in K_selection.")
+else:
+    for topo_name, by_scen in K_selection[ep].items():
+        for scen_name, sel in by_scen.items():
+            print(f"\n=== {topo_name} / {scen_name} ===")
+            dfm = sel["metrics_df"]
+            print(
+                dfm[[
+                    "K",
+                    "inertia",
+                    "silhouette",
+                    "calinski_harabasz",
+                    "davies_bouldin",
+                    "score"
+                ]].round(4)
+            )        
+
 
 
 
@@ -3612,8 +3680,34 @@ def step4_3_run_final_kmeans_for_all_envs(
     random_state: int = 42,
     verbose: bool = True
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Step 4.3: Run final K-Means clustering for all environments.
 
-    clustering_results = {}
+    Assumes:
+      - Step 4.1 has already built feature matrices under:
+            env_cfg["clustering"]["features"] = {
+                "X": np.ndarray (n_mecs, n_features),
+                "feature_cols": list[str],
+                "mec_ids": np.ndarray (n_mecs,),
+                "n_agents": int,
+                "n_features": int,
+            }
+      - Step 4.2 has already selected best_K under:
+            env_cfg["clustering"]["k_selection"]["best_K"]
+
+    For each (episode / topology / scenario), this function:
+      - runs KMeans with K = best_K
+      - stores the result under env_cfg["clustering"]["final"]
+
+    Returns:
+      clustering_results[ep_name][topology_name][scen_name] = {
+        "K": int,
+        "labels": np.ndarray (n_mecs,),
+        "centers": np.ndarray (K, n_features),
+        "mec_ids": np.ndarray (n_mecs,)
+      }
+    """
+    clustering_results: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for ep_name, by_topo in env_configs.items():
         clustering_results[ep_name] = {}
@@ -3627,27 +3721,40 @@ def step4_3_run_final_kmeans_for_all_envs(
                 feats = clust.get("features", None)
                 k_sel = clust.get("k_selection", None)
 
-                # sanity check
+                # --- Sanity: feature matrix must be present ---
                 if feats is None or "X" not in feats:
                     if verbose:
                         print(f"[4.3/skip] {ep_name}/{topo_name}/{scen_name}: no feature matrix.")
                     continue
 
+                # mec_ids must exist (MEC-based clustering only)
+                if "mec_ids" not in feats:
+                    raise ValueError(
+                        f"[4.3] {ep_name}/{topo_name}/{scen_name}: "
+                        "'mec_ids' missing in clustering.features (expected MEC-based features)."
+                    )
+
+                X = np.asarray(feats["X"], dtype=float)
+                mec_ids = np.asarray(feats["mec_ids"], dtype=int)
+
+                # --- Sanity: K selection must be available ---
                 if k_sel is None or "best_K" not in k_sel:
                     if verbose:
                         print(f"[4.3/skip] {ep_name}/{topo_name}/{scen_name}: no K chosen.")
                     continue
 
-                X = feats["X"]
-                agent_ids = feats["agent_ids"]
                 best_K = int(k_sel["best_K"])
 
+                # --- Sanity: K must be valid ---
                 if best_K <= 1 or best_K > X.shape[0]:
                     if verbose:
-                        print(f"[4.3/skip] invalid best_K={best_K} for {ep_name}/{topo_name}/{scen_name}.")
+                        print(
+                            f"[4.3/skip] invalid best_K={best_K} for "
+                            f"{ep_name}/{topo_name}/{scen_name} (n_mecs={X.shape[0]})."
+                        )
                     continue
 
-                # Final K-Means fit
+                # --- Final K-Means fit over MECs ---
                 km = KMeans(
                     n_clusters=best_K,
                     random_state=random_state,
@@ -3656,19 +3763,21 @@ def step4_3_run_final_kmeans_for_all_envs(
                 labels = km.fit_predict(X)
                 centers = km.cluster_centers_
 
-                # Store results
+                # --- Store results into env_config ---
+                env_cfg.setdefault("clustering", {})
                 env_cfg["clustering"]["final"] = {
                     "K": best_K,
                     "labels": labels,
                     "centers": centers,
-                    "agent_ids": agent_ids,
+                    "mec_ids": mec_ids,
                 }
 
+                # --- Also store in return dictionary ---
                 clustering_results[ep_name][topo_name][scen_name] = {
                     "K": best_K,
                     "labels": labels,
                     "centers": centers,
-                    "agent_ids": agent_ids,
+                    "mec_ids": mec_ids,
                 }
 
                 if verbose:
@@ -3687,12 +3796,12 @@ clustering_final = step4_3_run_final_kmeans_for_all_envs(
     verbose=True
 )
 
-# Example inspection
 print("\n=== STEP 4.3 EXAMPLE: ep_000 / clustered / heavy ===")
 ex = clustering_final["ep_000"]["clustered"]["heavy"]
 print("K:", ex["K"])
 print("Label counts:", np.bincount(ex["labels"]))
 print("Centers shape:", ex["centers"].shape)
+print("MEC IDs (first 10):", ex["mec_ids"][:10])
 
 
 
@@ -3704,9 +3813,9 @@ def step4_3_plot_clusters_pca(
 ):
     """
     For each environment (ep/topology/scenario), take:
-        - X (scaled feature matrix)
-        - labels (final K-Means labels)
-    Project X to 2D via PCA and save scatter plot.
+        - X (scaled MEC feature matrix)
+        - labels (final K-Means cluster labels)
+    Project X to 2D via PCA and save a scatter plot.
 
     Output saved as:
         <out_root>/<ep>/<topology>/<scenario>/cluster_plot_pca.png
@@ -3715,11 +3824,11 @@ def step4_3_plot_clusters_pca(
         for topo_name, by_scen in by_topo.items():
             for scen_name, env_cfg in by_scen.items():
 
-                # Must have clustering results
                 clust = env_cfg.get("clustering", {})
                 feats = clust.get("features", None)
                 final = clust.get("final", None)
 
+                # Need feature matrix and final clustering
                 if feats is None or "X" not in feats:
                     continue
                 if final is None or "labels" not in final:
@@ -3727,23 +3836,24 @@ def step4_3_plot_clusters_pca(
                         print(f"[PCA/skip] {ep_name}/{topo_name}/{scen_name}: no final KMeans labels.")
                     continue
 
-                X = feats["X"]
-                labels = final["labels"]
-                K = final["K"]
+                X = np.asarray(feats["X"], dtype=float)
+                labels = np.asarray(final["labels"], dtype=int)
+                K = int(final["K"])
 
-                n_agents = X.shape[0]
-                # PCA requires n_samples >= n_components (here 2)
-                if n_agents < 2:
+                n_mecs = X.shape[0]
+
+                # PCA requires n_samples >= n_components (2 here)
+                if n_mecs < 2:
                     if verbose:
                         print(f"[PCA/skip] {ep_name}/{topo_name}/{scen_name}: "
-                              f"n_agents={n_agents} < 2, cannot run PCA.")
+                              f"n_mecs={n_mecs} < 2, cannot run PCA.")
                     continue
 
-                # PCA projection
+                # PCA projection to 2D
                 pca = PCA(n_components=2, random_state=42)
                 X_2d = pca.fit_transform(X)
 
-                # Plot
+                # Output path
                 out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
                 os.makedirs(out_dir, exist_ok=True)
                 out_path = os.path.join(out_dir, "cluster_plot_pca.png")
@@ -3757,10 +3867,10 @@ def step4_3_plot_clusters_pca(
                         X_2d[mask, 1],
                         label=f"Cluster {cl}",
                         alpha=0.75,
-                        s=50
+                        s=50,
                     )
 
-                plt.title(f"PCA Clusters: {ep_name} / {topo_name} / {scen_name}  (K={K})")
+                plt.title(f"PCA Clusters (MEC): {ep_name} / {topo_name} / {scen_name}  (K={K})")
                 plt.xlabel("PCA Component 1")
                 plt.ylabel("PCA Component 2")
                 plt.legend()
@@ -3771,9 +3881,9 @@ def step4_3_plot_clusters_pca(
                 plt.close()
 
                 if verbose:
-                    print(f"[PCA] Saved PCA cluster plot → {out_path}")
-                                        
-                    
+                    print(f"[PCA] Saved PCA MEC cluster plot → {out_path}")
+
+
 step4_3_plot_clusters_pca(env_configs, verbose=True)
 
 
@@ -3784,12 +3894,15 @@ def step4_3_plot_clusters_tsne(
     out_root: str = "./artifacts/clustering",
     perplexity: int = 5,
     early_exaggeration: int = 12,
-    n_iter: int = 1500,
+    n_iter: int = 1500,   # kept in signature for compatibility, NOT used (depends on sklearn version)
     verbose: bool = True,
 ):
     """
-    Draw 2D t-SNE visualization for final KMeans clusters.
-    
+    Draw 2D t-SNE visualization for final KMeans clusters over MEC feature space.
+
+    NOTE: Some sklearn versions do not support `n_iter` in TSNE.__init__.
+          To keep compatibility, we rely on the library's default n_iter.
+
     Saves figure as:
         <out_root>/<ep>/<topology>/<scenario>/cluster_plot_tsne.png
     """
@@ -3802,6 +3915,7 @@ def step4_3_plot_clusters_tsne(
                 feats = clust.get("features", None)
                 final = clust.get("final", None)
 
+                # Need feature matrix and final clustering
                 if feats is None or "X" not in feats:
                     continue
                 if final is None or "labels" not in final:
@@ -3809,23 +3923,22 @@ def step4_3_plot_clusters_tsne(
                         print(f"[t-SNE/skip] {ep_name}/{topo_name}/{scen_name}: no cluster labels.")
                     continue
 
-                X = feats["X"]
-                labels = final["labels"]
-                K = final["K"]
+                X = np.asarray(feats["X"], dtype=float)
+                labels = np.asarray(final["labels"], dtype=int)
+                K = int(final["K"])
 
-                n_agents = X.shape[0]
-                if n_agents <= perplexity:
+                n_mecs = X.shape[0]
+                if n_mecs <= perplexity:
                     if verbose:
                         print(f"[t-SNE/skip] {ep_name}/{topo_name}/{scen_name}: "
-                              f"n_agents={n_agents} <= perplexity={perplexity}")
+                              f"n_mecs={n_mecs} <= perplexity={perplexity}")
                     continue
 
-                # Run t-SNE
+                # Run t-SNE (n_iter omitted for sklearn compatibility)
                 tsne = TSNE(
                     n_components=2,
                     perplexity=perplexity,
                     early_exaggeration=early_exaggeration,
-                    n_iter=n_iter,
                     init='pca',
                     learning_rate='auto',
                     random_state=42,
@@ -3848,10 +3961,10 @@ def step4_3_plot_clusters_tsne(
                         X_2d[mask, 1],
                         label=f"Cluster {cl}",
                         s=50,
-                        alpha=0.8
+                        alpha=0.8,
                     )
 
-                plt.title(f"t-SNE Clusters: {ep_name} / {topo_name} / {scen_name}  (K={K})")
+                plt.title(f"t-SNE Clusters (MEC): {ep_name} / {topo_name} / {scen_name}  (K={K})")
                 plt.xlabel("t-SNE Dim 1")
                 plt.ylabel("t-SNE Dim 2")
                 plt.grid(True)
@@ -3862,8 +3975,8 @@ def step4_3_plot_clusters_tsne(
                 plt.close()
 
                 if verbose:
-                    print(f"[t-SNE] Saved t-SNE cluster plot → {out_path}")
-                                        
+                    print(f"[t-SNE] Saved t-SNE MEC cluster plot → {out_path}")
+
 
 step4_3_plot_clusters_tsne(env_configs, verbose=True)
 
@@ -3872,6 +3985,7 @@ step4_3_plot_clusters_tsne(env_configs, verbose=True)
 
 
 # 4.4. Cluster Interpretation & Profiling
+
 def build_cluster_profiles_for_env(
     ep_name: str,
     topo_name: str,
@@ -3880,17 +3994,24 @@ def build_cluster_profiles_for_env(
     out_root: str = "./artifacts/clustering"
 ):
     """
-    Build cluster representative profiles using:
-      - labels from Step 4.3 (env_cfg['clustering']['final'])
-      - scaled centers from Step 4.3
-      - inverse-transformed centers using scaler from Step 4.1
-      - agent_profiles from Step 3
+    Build MEC-cluster representative profiles using:
+      - final KMeans labels from Step 4.3 (env_cfg['clustering']['final'])
+      - cluster centers (scaled feature space) from Step 4.3
+      - mec_profiles from Step 3
+      - feature metadata from Step 4.1
+
+    Effects:
+      - Adds `cluster_id` to mec_profiles (per MEC).
+      - Adds `cluster_id` to tasks (via mec_id).
+      - Computes per-cluster summary statistics.
+      - Saves CSVs for assignments, summaries, and centroids.
+      - Attaches results under env_cfg["clustering"]["profiles"].
     """
 
     # 1) Extract dependencies
     clust = env_cfg.get("clustering", {})
     feats = clust.get("features", None)
-    final = clust.get("final", None)   # This must exist (Step 4.3)
+    final = clust.get("final", None)   # must exist after Step 4.3
 
     if feats is None or "X" not in feats:
         raise ValueError(f"[4.4] Missing features for {ep_name}/{topo_name}/{scen_name}")
@@ -3905,59 +4026,65 @@ def build_cluster_profiles_for_env(
     labels         = np.asarray(final["labels"], dtype=int)
     centers_scaled = np.asarray(final["centers"], dtype=float)
 
-    agent_ids    = feats["agent_ids"]
-    feature_cols = feats["feature_cols"]
+    mec_ids     = np.asarray(feats["mec_ids"], dtype=int)
+    feature_cols = list(feats["feature_cols"])
 
-    prof = env_cfg["agent_profiles"].copy()
+    if "mec_profiles" not in env_cfg or not isinstance(env_cfg["mec_profiles"], pd.DataFrame):
+        raise ValueError(f"[4.4] env_cfg['mec_profiles'] must be a DataFrame for {ep_name}/{topo_name}/{scen_name}")
 
-    # 2) Build assignment table (agent_id → cluster_id)
+    mec_prof = env_cfg["mec_profiles"].copy()
+    if "mec_id" not in mec_prof.columns:
+        raise ValueError(f"[4.4] mec_profiles is missing 'mec_id' for {ep_name}/{topo_name}/{scen_name}")
+
+    # 2) Build assignment table (mec_id → cluster_id)
     assign_df = pd.DataFrame({
-        "agent_id": agent_ids,
+        "mec_id": mec_ids,
         "cluster_id": labels
     })
 
-    prof = prof.merge(assign_df, on="agent_id", how="left")
+    mec_prof = mec_prof.merge(assign_df, on="mec_id", how="left")
 
-    # === NEW: Inject cluster_id into tasks DataFrame ===
+    # 2bis) Inject cluster_id into tasks DataFrame based on mec_id
     tasks_df = env_cfg.get("tasks", None)
-    if tasks_df is not None and "agent_id" in tasks_df.columns:
-        tasks_df = tasks_df.merge(assign_df, on="agent_id", how="left")
-        # Convert to int (and fill agents with no tasks with -1)
+    if tasks_df is not None and "mec_id" in tasks_df.columns:
+        tasks_df = tasks_df.merge(assign_df, on="mec_id", how="left")
+        # MECs with no cluster (should not happen) get -1
         tasks_df["cluster_id"] = tasks_df["cluster_id"].fillna(-1).astype(int)
-        # write back
         env_cfg["tasks"] = tasks_df
         print(f"[4.4] Added 'cluster_id' to tasks for {ep_name}/{topo_name}/{scen_name} "
               f"(rows={len(tasks_df)})")
 
-    # Debug: Check if cluster_id is in tasks_df and cluster_summary
-    print(f"Debug: Tasks DataFrame for {ep_name}/{topo_name}/{scen_name} includes 'cluster_id':")
-    print(tasks_df.head())
+        # Debug: show first few rows of tasks with cluster_id
+        print(f"Debug: Tasks DataFrame head for {ep_name}/{topo_name}/{scen_name}:")
+        print(tasks_df.head())
 
-    # 3) Cluster-level summary (numeric columns only, excluding cluster_id from aggregation)
-    numeric_cols = prof.select_dtypes(include=[np.number]).columns.tolist()
-    # Separate group key from aggregated columns
+    # 3) Cluster-level summary over MEC profiles (numeric columns only)
+    numeric_cols = mec_prof.select_dtypes(include=[np.number]).columns.tolist()
+    # Group key is cluster_id; do not aggregate it
     agg_cols = [c for c in numeric_cols if c != "cluster_id"]
 
     cluster_summary = (
-        prof[["cluster_id"] + agg_cols]
+        mec_prof[["cluster_id"] + agg_cols]
         .groupby("cluster_id", as_index=False)
         .mean()
         .sort_values("cluster_id")
     )
 
     cluster_sizes = (
-        prof.groupby("cluster_id")["agent_id"]
+        mec_prof.groupby("cluster_id")["mec_id"]
         .count()
-        .rename("n_agents_cluster")
+        .rename("n_mecs_cluster")
         .reset_index()
     )
     cluster_summary = cluster_summary.merge(cluster_sizes, on="cluster_id", how="left")
 
-    # Debug: Check if cluster_summary has 'cluster_id'
-    print(f"Debug: Cluster summary for {ep_name}/{topo_name}/{scen_name} includes 'cluster_id':")
+    # Debug: show cluster summary head
+    print(f"Debug: MEC cluster summary for {ep_name}/{topo_name}/{scen_name}:")
     print(cluster_summary.head())
 
-    # 4) Decode centroids back to original scale (no need for scaler now)
+    # 4) Decode centroids back to "original" scale
+    #    (since we no longer keep a scaler, we keep the scaled space as-is;
+    #     centers_original is equal to centers_scaled here.)
     centers_original = centers_scaled.copy()
 
     centroids_scaled_df = pd.DataFrame(centers_scaled, columns=feature_cols)
@@ -3970,20 +4097,22 @@ def build_cluster_profiles_for_env(
     out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    assign_path    = os.path.join(out_dir, "cluster_assignments.csv")
-    summary_path   = os.path.join(out_dir, "cluster_summary.csv")
-    cent_sc_path   = os.path.join(out_dir, "centroids_scaled.csv")
-    cent_orig_path = os.path.join(out_dir, "centroids_original.csv")
+    assign_path    = os.path.join(out_dir, "mec_cluster_assignments.csv")
+    summary_path   = os.path.join(out_dir, "mec_cluster_summary.csv")
+    cent_sc_path   = os.path.join(out_dir, "mec_centroids_scaled.csv")
+    cent_orig_path = os.path.join(out_dir, "mec_centroids_original.csv")
 
     assign_df.to_csv(assign_path, index=False)
     cluster_summary.to_csv(summary_path, index=False)
     centroids_scaled_df.to_csv(cent_sc_path, index=False)
     centroids_original_df.to_csv(cent_orig_path, index=False)
 
-    print(f"[4.4] {ep_name}/{topo_name}/{scen_name} → cluster profiles built.")
-    print(cluster_sizes.set_index("cluster_id")["n_agents_cluster"])
+    print(f"[4.4] {ep_name}/{topo_name}/{scen_name} → MEC cluster profiles built.")
+    print(cluster_sizes.set_index("cluster_id")["n_mecs_cluster"])
 
-    # 6) Attach final results to env_cfg
+    # 6) Attach final results back to env_cfg
+    env_cfg["mec_profiles"] = mec_prof
+    env_cfg.setdefault("clustering", {})
     env_cfg["clustering"]["profiles"] = {
         "K": best_K,
         "cluster_assignments": assign_df,
@@ -3996,9 +4125,15 @@ def build_cluster_profiles_for_env(
 
     return env_cfg["clustering"]["profiles"]
 
+def build_all_cluster_profiles(env_configs: Dict[str, Dict[str, Dict[str, Any]]]):
+    """
+    Run cluster profile construction (Step 4.4) for all ep/topology/scenario combos.
 
-def build_all_cluster_profiles(env_configs):
-    out = {}
+    Returns:
+      out[ep_name][topo_name][scen_name] = clustering profiles dict
+    """
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
     for ep_name, by_topo in env_configs.items():
         out[ep_name] = {}
         for topo_name, by_scen in by_topo.items():
@@ -4017,7 +4152,7 @@ def build_all_cluster_profiles(env_configs):
 # ---- Run Step 4.4 on all environments ----
 cluster_profiles = build_all_cluster_profiles(env_configs)
 
-print("\n=== EXAMPLE: cluster summary for ep_000 / clustered / heavy ===")
+print("\n=== EXAMPLE: MEC cluster summary for ep_000 / clustered / heavy ===")
 ex_ep   = "ep_000"
 ex_topo = "clustered"
 ex_scen = "heavy"
@@ -4028,29 +4163,35 @@ if (ex_ep in cluster_profiles and
 
     ex_prof = cluster_profiles[ex_ep][ex_topo][ex_scen]
     print("K =", ex_prof["K"])
-    print("\nCluster summary (first few cols):")
+    print("\nCluster summary (first few columns):")
     print(ex_prof["cluster_summary"].iloc[:, :10])
 else:
     print("[warn] Example triple not found in cluster_profiles.")
     
 
+# Quick debug peek
 test = env_configs["ep_000"]["clustered"]["heavy"]["clustering"]
-print(test.keys())
-
+print("\nclustering keys:", test.keys())
+print("\nMEC cluster summary:")
 print(env_configs["ep_000"]["clustered"]["heavy"]["clustering"]["profiles"]["cluster_summary"])
 
 
+
 # Heatmap Visualization
-def plot_cluster_profile_heatmap(env_cfg,
-                                 ep_name: str,
-                                 topo_name: str,
-                                 scen_name: str,
-                                 out_root="./artifacts/clustering"):
+def plot_cluster_profile_heatmap(
+    env_cfg: Dict[str, Any],
+    ep_name: str,
+    topo_name: str,
+    scen_name: str,
+    out_root: str = "./artifacts/clustering"
+):
     """
-    Draw heatmap of cluster profile means for a given env_cfg.
+    Draw a heatmap of MEC cluster profile means for a given env_cfg.
 
     Uses:
         env_cfg["clustering"]["profiles"]["cluster_summary"]
+    Each row = one cluster_id
+    Each column = one numeric cluster-level feature (mean over MECs in that cluster)
     """
 
     # 1) Extract cluster profiles
@@ -4062,33 +4203,49 @@ def plot_cluster_profile_heatmap(env_cfg,
         return None
 
     cluster_summary = profs["cluster_summary"].copy()
-    K = profs["K"]
+    K = int(profs["K"])
 
-    # remove non-feature columns if present
-    drop_cols = ["cluster_id", "n_agents_cluster"]
+    # 2) Drop non-feature columns
+    #   - cluster_id: used only for row labels
+    #   - n_mecs_cluster: cluster size, not a feature
+    drop_cols = ["cluster_id", "n_mecs_cluster"]
     feature_cols = [c for c in cluster_summary.columns if c not in drop_cols]
 
-    df = cluster_summary[feature_cols].copy()
+    # Keep only numeric feature columns (avoid issues if any column is non-numeric)
+    numeric_feature_cols = [
+        c for c in feature_cols
+        if np.issubdtype(cluster_summary[c].dtype, np.number)
+    ]
 
-    # 2) Normalize per-column
+    if not numeric_feature_cols:
+        print(f"[heatmap/skip] No numeric cluster-level features for {ep_name}/{topo_name}/{scen_name}")
+        return None
+
+    df = cluster_summary[numeric_feature_cols].copy()
+
+    # 3) Normalize each feature column to [0, 1] for better visualization
     df_norm = (df - df.min()) / (df.max() - df.min() + 1e-9)
 
-    # 3) Output directory
+    # 4) Prepare output path
     out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "cluster_profile_heatmap.png")
 
-    # 4) Plot heatmap
+    # 5) Row labels based on actual cluster_id values
+    cluster_ids = cluster_summary["cluster_id"].tolist()
+    yticklabels = [f"Cluster {cid}" for cid in cluster_ids]
+
+    # 6) Plot heatmap
     plt.figure(figsize=(14, 6))
     sns.heatmap(
         df_norm,
         annot=False,
         cmap="viridis",
         xticklabels=df_norm.columns,
-        yticklabels=[f"Cluster {i}" for i in range(K)]
+        yticklabels=yticklabels
     )
 
-    plt.title(f"Cluster Profile Heatmap: {ep_name}/{topo_name}/{scen_name}")
+    plt.title(f"Cluster Profile Heatmap (MEC): {ep_name}/{topo_name}/{scen_name}")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
@@ -4097,6 +4254,7 @@ def plot_cluster_profile_heatmap(env_cfg,
     return out_path
 
 
+# ---- Run heatmap for all environments ----
 for ep in env_configs:
     for topo in env_configs[ep]:
         for scen in env_configs[ep][topo]:
@@ -4104,50 +4262,128 @@ for ep in env_configs:
                 env_configs[ep][topo][scen],
                 ep, topo, scen
             )
- 
 
-# # Saving Information
-def save_env_configs_to_csv(env_configs, out_root="./artifacts/env_configs"):
+
+
+# Saving Information
+def save_env_configs_to_csv(
+    env_configs: Dict[str, Dict[str, Dict[str, Any]]],
+    out_root: str = "./artifacts/env_configs"
+) -> None:
     """
-    Save the env_configs data to CSV format in the appropriate folders based on ep, topology, and scenario.
+    Save env_configs content to CSV files in a structured folder hierarchy:
+
+        <out_root>/<episode>/<topology>/<scenario>/
+
+    For each env_cfg, this function saves (when available):
+      - episodes.csv
+      - agents.csv
+      - arrivals.csv
+      - tasks.csv              (labeled + cluster_id, etc.)
+      - agent_profiles.csv
+      - clustering_k_selection_metrics.csv
+      - cluster_assignments.csv
+      - cluster_summary.csv
+      - centroids_scaled.csv
+      - centroids_original.csv
+
+    Note:
+      Only pandas DataFrames are saved as CSV. Nested non-DataFrame
+      objects inside env_cfg["clustering"] (e.g., numpy arrays) are
+      not saved here.
     """
-    # Loop through each ep in env_configs
     for ep_name, by_topo in env_configs.items():
         for topo_name, by_scen in by_topo.items():
             for scen_name, env_cfg in by_scen.items():
-                # Create the folders for each ep, topology, and scenario
+
+                # Create directory for this (episode, topology, scenario)
                 out_dir = os.path.join(out_root, ep_name, topo_name, scen_name)
                 os.makedirs(out_dir, exist_ok=True)
-                
-                # Save the existing DataFrames in env_cfg to CSV files
-                if "agent_profiles" in env_cfg:
-                    agent_profiles_path = os.path.join(out_dir, "agent_profiles.csv")
-                    env_cfg["agent_profiles"].to_csv(agent_profiles_path, index=False)
-                    print(f"[save] agent_profiles saved to {agent_profiles_path}")
 
-                if "tasks" in env_cfg:
-                    tasks_path = os.path.join(out_dir, "tasks.csv")
-                    env_cfg["tasks"].to_csv(tasks_path, index=False)
-                    print(f"[save] tasks saved to {tasks_path}")
+                # --- Core tables ---
+                if "episodes" in env_cfg and isinstance(env_cfg["episodes"], pd.DataFrame):
+                    path = os.path.join(out_dir, "episodes.csv")
+                    env_cfg["episodes"].to_csv(path, index=False)
+                    print(f"[save] episodes → {path}")
 
-                if "clustering" in env_cfg:
-                    clustering_path = os.path.join(out_dir, "clustering.csv")
-                    # If clustering data needs to be saved
-                    pd.DataFrame(env_cfg["clustering"]).to_csv(clustering_path, index=False)
-                    print(f"[save] clustering saved to {clustering_path}")
+                if "agents" in env_cfg and isinstance(env_cfg["agents"], pd.DataFrame):
+                    path = os.path.join(out_dir, "agents.csv")
+                    env_cfg["agents"].to_csv(path, index=False)
+                    print(f"[save] agents → {path}")
 
-                # If there are other data to be saved, you can add them here
-                # For example, if "tasks_df" exists, you can save it as well
+                if "arrivals" in env_cfg and isinstance(env_cfg["arrivals"], pd.DataFrame):
+                    path = os.path.join(out_dir, "arrivals.csv")
+                    env_cfg["arrivals"].to_csv(path, index=False)
+                    print(f"[save] arrivals → {path}")
 
-    print(f"[save] All data has been saved in the folder {out_root}.")
+                if "tasks" in env_cfg and isinstance(env_cfg["tasks"], pd.DataFrame):
+                    path = os.path.join(out_dir, "tasks.csv")
+                    env_cfg["tasks"].to_csv(path, index=False)
+                    print(f"[save] tasks → {path}")
 
-# Using the function
+                # --- Agent profiles (Step 3) ---
+                if "agent_profiles" in env_cfg and isinstance(env_cfg["agent_profiles"], pd.DataFrame):
+                    path = os.path.join(out_dir, "agent_profiles.csv")
+                    env_cfg["agent_profiles"].to_csv(path, index=False)
+                    print(f"[save] agent_profiles → {path}")
+
+                # --- Clustering-related artifacts ---
+                clust = env_cfg.get("clustering", {})
+
+                # 1) K-selection metrics (Step 4.2)
+                k_sel = clust.get("k_selection", None)
+                if isinstance(k_sel, dict):
+                    metrics_df = k_sel.get("metrics_df", None)
+                    if isinstance(metrics_df, pd.DataFrame):
+                        path = os.path.join(out_dir, "clustering_k_selection_metrics.csv")
+                        metrics_df.to_csv(path, index=False)
+                        print(f"[save] k_selection metrics → {path}")
+
+                # 2) Cluster profiles (Step 4.4)
+                profs = clust.get("profiles", None)
+                if isinstance(profs, dict):
+                    # cluster_assignments: DataFrame(agent_id, mec_id, cluster_id) if present
+                    ca = profs.get("cluster_assignments", None)
+                    if isinstance(ca, pd.DataFrame):
+                        path = os.path.join(out_dir, "cluster_assignments.csv")
+                        ca.to_csv(path, index=False)
+                        print(f"[save] cluster_assignments → {path}")
+
+                    # cluster_summary: per-cluster aggregated stats
+                    cs = profs.get("cluster_summary", None)
+                    if isinstance(cs, pd.DataFrame):
+                        path = os.path.join(out_dir, "cluster_summary.csv")
+                        cs.to_csv(path, index=False)
+                        print(f"[save] cluster_summary → {path}")
+
+                    # centroids (scaled)
+                    cent_scaled_df = profs.get("centroids_scaled_df", None)
+                    if isinstance(cent_scaled_df, pd.DataFrame):
+                        path = os.path.join(out_dir, "centroids_scaled.csv")
+                        cent_scaled_df.to_csv(path, index=False)
+                        print(f"[save] centroids_scaled → {path}")
+
+                    # centroids (original scale)
+                    cent_orig_df = profs.get("centroids_original_df", None)
+                    if isinstance(cent_orig_df, pd.DataFrame):
+                        path = os.path.join(out_dir, "centroids_original.csv")
+                        cent_orig_df.to_csv(path, index=False)
+                        print(f"[save] centroids_original → {path}")
+
+                # If you ever want to also save the raw feature matrix X or labels/centers
+                # (which are numpy arrays), it's better to use np.save in a separate helper
+                # rather than forcing them into CSV here.
+
+    print(f"[save] All data has been saved under '{out_root}'.")
+
+
+# Usage
 save_env_configs_to_csv(env_configs)
 
 
 
 
-
+# اینجاااااااممممممممم
 # Step 5: MDP Environment
 
 # Step 5.2 - Action Semantics (Contextual Bandit)
